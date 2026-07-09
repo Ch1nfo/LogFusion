@@ -1,0 +1,9 @@
+raw:
+  include_text_in_event: true
+
+sources:
+  - source_id: runtime_unknown
+    source_type: auto
+    record_mode: line
+    paths:
+      - data/unknown/*.log

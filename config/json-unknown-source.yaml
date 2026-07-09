@@ -1,0 +1,9 @@
+raw:
+  include_text_in_event: true
+
+sources:
+  - source_id: json_unknown
+    source_type: auto
+    record_mode: line
+    paths:
+      - output/json_data.log

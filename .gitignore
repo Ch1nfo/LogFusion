@@ -1,0 +1,66 @@
+# Runtime / parse artifacts (may contain real log content)
+output/
+*.jsonl
+!tests/**/*.jsonl
+
+# Local raw log dumps (not curated fixtures)
+logs example.txt
+*.log
+
+# Sample logs often contain internal IPs, usernames, paths, tokens.
+# Keep data/ local-only unless samples are explicitly redacted.
+data/
+
+# Secrets and credentials — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*credential*
+*credentials*
+*passwd*
+*password*
+auth.json
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+
+# Test / type / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local overrides
+config/*.local.yaml
+config/local*.yaml

@@ -1,0 +1,2 @@
+"""Logfusion local parsing MVP."""
+

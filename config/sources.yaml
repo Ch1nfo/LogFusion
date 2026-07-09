@@ -1,0 +1,24 @@
+raw:
+  include_text_in_event: true
+
+sources:
+  - source_id: svn_sample
+    source_type: svn
+    record_mode: line
+    paths:
+      - data/svn/*.log
+  - source_id: sso_sample
+    source_type: sso
+    record_mode: object
+    paths:
+      - data/sso/*.txt
+  - source_id: gitlab_sample
+    source_type: gitlab
+    record_mode: line
+    paths:
+      - data/gitlab/*.jsonl
+  - source_id: hiklink_sample
+    source_type: hiklink
+    record_mode: object
+    paths:
+      - data/hiklink/*.txt

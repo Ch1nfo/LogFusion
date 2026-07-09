@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logfusion"
+version = "0.1.0"
+description = "Local-file log parsing MVP with Canonical Event output and parser lifecycle tooling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LogFusion contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+logfusion = "logfusion.cli:main"
+
+[project.urls]
+Documentation = "docs/local-file-parser-mvp-design.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["logfusion*"]
+exclude = ["tests*", "output*", "data*", "docs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
