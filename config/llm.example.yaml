@@ -1,0 +1,10 @@
+# Copy to config/llm.local.yaml and adjust for your enterprise gateway or local model.
+# Keep API keys in the environment variable named by api_key_env.
+llm:
+  enabled: true
+  provider: openai_compatible
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  timeout_seconds: 30
+  sample_limit: 5

@@ -15,6 +15,15 @@ def run_shadow_replay(
 ) -> dict[str, Any]:
     registry = load_registry(registry_path)
     unknown_records = _read_jsonl(unknown_input)
+    return run_shadow_replay_records(registry_path, unknown_records, parser_id)
+
+
+def run_shadow_replay_records(
+    registry_path: Path,
+    unknown_records: list[dict[str, Any]],
+    parser_id: str | None = None,
+) -> dict[str, Any]:
+    registry = load_registry(registry_path)
     shadow_parsers = _shadow_parsers(registry, parser_id)
     reports = [_replay_parser(parser, unknown_records) for parser in shadow_parsers]
 
@@ -58,7 +67,7 @@ def _replay_record(parser: dict[str, Any], unknown_record: dict[str, Any]) -> di
     raw = unknown_record.get("raw", {})
     raw_text = raw.get("text", "")
     extracted = extract_fields(parser, raw_text)
-    expected_fields = parser.get("field_candidates", {})
+    expected_fields = _expected_fields(parser, raw.get("record_id"))
     missing_or_mismatched = {
         key: {"expected": value, "actual": extracted.get(key)}
         for key, value in expected_fields.items()
@@ -72,6 +81,13 @@ def _replay_record(parser: dict[str, Any], unknown_record: dict[str, Any]) -> di
         "extracted_fields": extracted,
         "missing_or_mismatched": missing_or_mismatched,
     }
+
+
+def _expected_fields(parser: dict[str, Any], record_id: str | None) -> dict[str, Any]:
+    for test_case in parser.get("test_cases", []):
+        if test_case.get("record_id") == record_id:
+            return test_case.get("expected_fields", {})
+    return parser.get("field_candidates", {})
 
 
 def _schema_mapping_rate(parser: dict[str, Any]) -> float:

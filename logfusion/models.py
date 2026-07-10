@@ -17,3 +17,6 @@ class RawRecord:
     size_bytes: int
     storage_ref: str
     include_raw_text: bool
+    product: str | None = None
+    format_version: str | None = None
+    llm_enabled: bool = False

@@ -36,6 +36,27 @@ def test_replay_raw_records_matches_file_parse_counts(tmp_path):
     assert replayed.normalized[0]["raw"]["storage_ref"] == "file://data/svn/sample.log#L1-L1"
 
 
+def test_raw_store_preserves_source_contract_metadata(tmp_path):
+    source_file = tmp_path / "edr.log"
+    source_file.write_text("user=alice action=process_start\n", encoding="utf-8")
+    raw_store = tmp_path / "raw.jsonl"
+    sources = [{
+        "source_id": "edr_acme",
+        "source_type": "edr",
+        "product": "acme-edr",
+        "format_version": "v1",
+        "llm_enabled": True,
+        "paths": [str(source_file)],
+    }]
+
+    write_raw_store(sources, raw_store)
+
+    record = list(iter_stored_raw_records(raw_store))[0]
+    assert record.product == "acme-edr"
+    assert record.format_version == "v1"
+    assert record.llm_enabled is True
+
+
 def test_cli_parse_can_write_raw_store_and_replay_raw(tmp_path):
     raw_store = tmp_path / "raw_records.jsonl"
     normalized = tmp_path / "normalized.jsonl"

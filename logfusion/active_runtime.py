@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from logfusion.models import RawRecord
+from logfusion.parser_contract import record_format_fingerprint
 from logfusion.parser_registry import load_registry
 from logfusion.parser_runtime import extract_fields
 
@@ -32,6 +33,8 @@ def parse_with_active_parsers(record: RawRecord, active_parsers: list[dict[str, 
 
 
 def _try_active_parser(record: RawRecord, parser: dict[str, Any]) -> dict[str, Any] | None:
+    if not _matches_source_contract(record, parser):
+        return None
     try:
         fields = extract_fields(parser, record.raw_text)
     except Exception:
@@ -41,9 +44,34 @@ def _try_active_parser(record: RawRecord, parser: dict[str, Any]) -> dict[str, A
         return None
 
     event = _base_active_event(record, parser)
+    _apply_event_defaults(event, parser.get("event_defaults", {}))
     _apply_schema_mapping(event, fields, parser.get("schema_mapping", {}))
+    _apply_action_mapping(
+        event,
+        fields,
+        parser.get("schema_mapping", {}),
+        parser.get("action_mapping", {}),
+        parser.get("action_source_field"),
+    )
+    _apply_http_outcome(event)
     event["extensions"]["active_parser"] = fields
     return event
+
+
+def _matches_source_contract(record: RawRecord, parser: dict[str, Any]) -> bool:
+    if not parser.get("enforce_source_contract"):
+        return True
+    contract = parser.get("source_contract") or {}
+    return (
+        contract.get("source_id") == record.source_id
+        and contract.get("source_type") == record.source_type
+        and contract.get("format_fingerprint")
+        == record_format_fingerprint(
+            record.source_id, record.source_type, record.raw_text, record.product, record.format_version,
+        )
+        and (not contract.get("product") or contract["product"] == record.product)
+        and (not contract.get("format_version") or contract["format_version"] == record.format_version)
+    )
 
 
 def _select_parser_match(matches: list[tuple[dict[str, Any], dict[str, Any]]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -146,13 +174,60 @@ def _apply_schema_mapping(event: dict[str, Any], fields: dict[str, str], mapping
     for source_field, target_path in mapping.items():
         if source_field not in fields:
             continue
-        value: Any = fields[source_field]
-        if target_path == "network.bytes":
-            try:
-                value = int(value)
-            except ValueError:
-                pass
+        value = _normalize_mapped_value(fields[source_field], target_path)
         _set_path(event, target_path, value)
+
+
+def _normalize_mapped_value(value: Any, target_path: str) -> Any:
+    if target_path in {"network.bytes", "http.response.status_code"}:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+    if target_path == "event.time" and isinstance(value, str):
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized).isoformat()
+        except ValueError:
+            pass
+        try:
+            return datetime.strptime(value, "%d/%b/%Y:%H:%M:%S %z").isoformat()
+        except ValueError:
+            return value
+    return value
+
+
+def _apply_action_mapping(
+    event: dict[str, Any],
+    fields: dict[str, Any],
+    schema_mapping: dict[str, str],
+    action_mapping: dict[str, str],
+    action_source_field: str | None,
+) -> None:
+    if not action_mapping:
+        return
+    if action_source_field and action_source_field in fields:
+        event["event"]["action"] = action_mapping.get(
+            str(fields[action_source_field]), fields[action_source_field],
+        )
+        return
+    for source_field, target_path in schema_mapping.items():
+        if target_path == "event.action" and source_field in fields:
+            event["event"]["action"] = action_mapping.get(str(fields[source_field]), fields[source_field])
+            return
+
+
+def _apply_event_defaults(event: dict[str, Any], defaults: dict[str, Any]) -> None:
+    for target_path in ("event.category", "event.type", "event.action", "event.outcome"):
+        if target_path in defaults:
+            _set_path(event, target_path, defaults[target_path])
+
+
+def _apply_http_outcome(event: dict[str, Any]) -> None:
+    status_code = event.get("http", {}).get("response", {}).get("status_code")
+    if event["event"].get("outcome") != "unknown" or not isinstance(status_code, int):
+        return
+    event["event"]["outcome"] = "success" if 200 <= status_code < 400 else "failure"
 
 
 def _set_path(document: dict[str, Any], field_path: str, value: Any) -> None:

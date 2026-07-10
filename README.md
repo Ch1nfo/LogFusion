@@ -2,7 +2,7 @@
 
 本地日志解析 MVP：把本地文件日志归一成 **Canonical Event v0**，无法识别的记录进入 unknown 池，并提供 parser 候选 → 注册 → 测试 → shadow → active 的完整生命周期，以及 raw 回放与版本对比。
 
-当前阶段**只做本地文件**，不做 Kafka，也不调用真实 LLM。
+当前阶段**只做本地文件**，不做 Kafka。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
 
 ## 环境
 
@@ -151,6 +151,37 @@ conda run -n agent python -m logfusion replay compare \
 
 Record 级变化类型：`unknown_resolved` / `new_unknown` / `parser_changed` / `event_changed` / `new_record` / `removed_record` / `unchanged`。
 
+## 新日志源的 LLM Parser 生成
+
+新接入源可声明自己的格式契约，并显式开启 LLM 候选生成：
+
+```yaml
+- source_id: edr_acme
+  source_type: edr
+  product: acme-edr
+  format_version: v1
+  llm_enabled: true
+  record_mode: line
+  paths:
+    - data/edr/*.log
+```
+
+Unknown Pool 会按同一来源与格式指纹聚类。先复制 `config/llm.example.yaml` 为 `config/llm.local.yaml`，填写企业网关或自托管模型地址；该本地文件已被 Git 忽略。以下命令生成独立 `draft` parser，并自动执行测试和 shadow replay：
+
+```bash
+export DEEPSEEK_API_KEY='...'
+cp config/llm.example.yaml config/llm.local.yaml
+
+conda run -n agent python -m logfusion propose-parsers \
+  --unknown-input output/edr_unknown.jsonl \
+  --output output/edr_candidates.jsonl \
+  --report-output output/edr_llm_report.json \
+  --llm-config config/llm.local.yaml \
+  --registry output/parser_registry.json --auto-validate
+```
+
+API Key 只从环境变量读取；常见凭据字段会在调用模型前脱敏。验证成功的 LLM 候选进入 `pending_approval`，仍需人工切换为 `active` 才能参与正式解析。
+
 ## 质量漂移
 
 对比两次 parse 的 summary：
@@ -169,7 +200,7 @@ conda run -n agent python -m logfusion quality drift \
 | 命令 | 作用 |
 |------|------|
 | `parse` | 本地文件 → normalized / unknown / summary（可选 raw store、registry） |
-| `propose-parsers` | unknown → draft parser 候选 |
+| `propose-parsers` | unknown → 启发式或 LLM draft parser 候选 |
 | `registry register-candidates` | 候选写入 registry |
 | `registry list` | 列出 registry 中的 parser |
 | `registry set-status` | 受控状态流转 |
@@ -245,7 +276,6 @@ sources:
 ## 明确不做（本阶段）
 
 - Kafka / 远程采集
-- 真实 LLM 调用（仅有 prompt 载荷接口）
 - ECS / OCSF 导出适配器
 - 数据库持久化（产物均为本地 JSON / JSONL）
 

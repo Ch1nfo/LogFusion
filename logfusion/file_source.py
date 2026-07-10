@@ -91,6 +91,9 @@ def _record(
         size_bytes=len(text.encode("utf-8")),
         storage_ref=f"file://{path}#L{line_start}-L{line_end}",
         include_raw_text=bool(source.get("include_raw_text", False)),
+        product=source.get("product"),
+        format_version=source.get("format_version"),
+        llm_enabled=bool(source.get("llm_enabled", False)),
     )
 
 

@@ -13,7 +13,8 @@ class ParserRegistryError(ValueError):
 ALLOWED_TRANSITIONS = {
     "draft": {"testing", "deprecated", "blocked"},
     "testing": {"shadow", "deprecated", "blocked"},
-    "shadow": {"active", "deprecated"},
+    "shadow": {"active", "pending_approval", "deprecated"},
+    "pending_approval": {"active", "deprecated"},
     "active": {"deprecated"},
     "deprecated": set(),
     "blocked": set(),
@@ -52,6 +53,8 @@ def set_parser_status(registry_path: Path, parser_id: str, status: str) -> dict[
         raise ParserRegistryError("Parser must have passing parser tests before entering shadow")
     if status == "active" and not _has_successful_shadow_replay(parser):
         raise ParserRegistryError("Parser must have successful shadow replay before entering active")
+    if status == "active" and parser.get("approval_required") and current != "pending_approval":
+        raise ParserRegistryError("LLM parser must enter pending_approval before entering active")
     parser["status"] = status
     parser["updated_at"] = _now()
     save_registry(registry, registry_path)
@@ -80,6 +83,11 @@ def _candidate_to_parser_record(candidate: dict[str, Any], now: str) -> dict[str
     return {
         "parser_id": candidate["candidate_id"],
         "source_type": candidate.get("suggested_source_type", "unknown"),
+        "source_contract": candidate.get("source_contract"),
+        "format_fingerprint": candidate.get("format_fingerprint"),
+        "enforce_source_contract": candidate.get("source") == "llm",
+        "generated_by": candidate.get("generated_by", "heuristic"),
+        "approval_required": candidate.get("source") == "llm",
         "format": candidate.get("detected_format", "text"),
         "version": "0.1.0",
         "status": "draft",
@@ -93,11 +101,14 @@ def _candidate_to_parser_record(candidate: dict[str, Any], now: str) -> dict[str
         "field_extractors": suggested_parser.get("field_extractors", {}),
         "field_candidates": field_candidates,
         "schema_mapping": schema_mapping,
+        "action_mapping": suggested_parser.get("action_mapping", {}),
+        "action_source_field": suggested_parser.get("action_source_field"),
+        "event_defaults": suggested_parser.get("event_defaults", {}),
         "test_case_count": 0,
         "success_rate": 0.0,
         "schema_mapping_rate": round(mapping_rate, 6),
         "sample_count": candidate.get("sample_count", 0),
-        "test_cases": _candidate_test_cases(candidate, field_candidates),
+        "test_cases": candidate.get("test_cases") or _candidate_test_cases(candidate, field_candidates),
     }
 
 

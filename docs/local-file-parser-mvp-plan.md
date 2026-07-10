@@ -53,14 +53,14 @@
 
 **Goal:** Optionally call a real LLM from `propose-parsers` to improve draft `suggested_parser` quality, while keeping heuristics as the offline default and never putting LLM calls on the hot parse path.
 
-**Status:** 🟡 Design in progress (not implemented)
+**Status:** ✅ Implemented
 
 ### Intended outcomes
 
-- CLI can request LLM-backed proposals (opt-in flag / config).
-- LLM output is validated and still emitted only as `draft` candidates.
-- Existing registry → test → shadow → active gates remain unchanged.
-- Secrets (API keys) stay out of git; local-only config / env.
+- [x] CLI can request LLM-backed proposals through an OpenAI-compatible Provider.
+- [x] LLM output is validated and emitted only as source-scoped `draft` candidates.
+- [x] Automatic parser test and shadow replay produce `pending_approval`; activation remains human-approved.
+- [x] API keys stay in environment variables; samples are redacted before Provider requests.
 
 ### Out of scope for Phase 2
 

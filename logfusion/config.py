@@ -65,6 +65,29 @@ def load_sources_config(path: Path) -> list[dict[str, Any]]:
     return sources
 
 
+def load_llm_config(path: Path) -> dict[str, Any]:
+    """Load the small `llm:` YAML section used by the local provider config."""
+    settings: dict[str, Any] = {}
+    in_llm_section = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "llm:":
+            in_llm_section = True
+            continue
+        if not raw_line[0].isspace() and stripped.endswith(":"):
+            in_llm_section = False
+            continue
+        if in_llm_section and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            settings[key.strip()] = _typed_value(value)
+    for numeric_key in ("timeout_seconds", "sample_limit"):
+        if numeric_key in settings:
+            settings[numeric_key] = int(settings[numeric_key])
+    return settings
+
+
 def _value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:

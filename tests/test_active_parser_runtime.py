@@ -237,3 +237,74 @@ def test_active_parser_without_conflict_has_no_conflict_metadata(tmp_path):
 
     assert result.normalized[0]["parser"]["id"] == "candidate_only"
     assert "conflict" not in result.normalized[0]["parser"]
+
+
+def test_active_parser_converts_apache_timestamp_and_http_status(tmp_path):
+    registry_path = tmp_path / "registry.json"
+    log_path = tmp_path / "apache.log"
+    log_path.write_text("[02/Aug/2024:12:34:56 +0800] status=207 user=alice\n", encoding="utf-8")
+    registry_path.write_text(json.dumps({"version": 1, "parsers": [{
+        "parser_id": "apache_llm_parser",
+        "source_type": "apache_test",
+        "format": "text",
+        "version": "0.1.0",
+        "status": "active",
+        "priority": 100,
+        "field_candidates": {"timestamp": "02/Aug/2024:12:34:56 +0800", "status": "207", "user": "alice"},
+        "field_extractors": {"pattern": r"\[(?P<timestamp>[^\]]+)\] status=(?P<status>\d+) user=(?P<user>\S+)"},
+        "parser_type": "regex",
+        "schema_mapping": {"timestamp": "event.time", "status": "http.response.status_code", "user": "user.name"},
+        "success_rate": 1.0,
+        "schema_mapping_rate": 1.0,
+        "shadow_replay_success_rate": 1.0,
+    }]}), encoding="utf-8")
+
+    result = run_pipeline([{
+        "source_id": "apache_test",
+        "source_type": "apache_test",
+        "record_mode": "line",
+        "include_raw_text": True,
+        "paths": [str(log_path)],
+    }], registry_path=registry_path)
+
+    assert result.unknown == []
+    assert result.normalized[0]["event"]["time"] == "2024-08-02T12:34:56+08:00"
+    assert result.normalized[0]["http"]["response"]["status_code"] == 207
+
+
+def test_active_parser_applies_event_defaults_action_taxonomy_and_http_outcome(tmp_path):
+    registry_path = tmp_path / "registry.json"
+    log_path = tmp_path / "svn.log"
+    log_path.write_text("operation=get-file status=207 user=alice\n", encoding="utf-8")
+    registry_path.write_text(json.dumps({"version": 1, "parsers": [{
+        "parser_id": "svn_llm_parser",
+        "source_type": "svn_test",
+        "format": "key_value",
+        "version": "0.1.0",
+        "status": "active",
+        "priority": 100,
+        "field_candidates": {"operation": "get-file", "status": "207", "user": "alice"},
+        "field_extractors": {},
+        "parser_type": "key_value",
+        "schema_mapping": {"operation": "extensions.svn.operation", "status": "http.response.status_code", "user": "user.name"},
+        "event_defaults": {"event.category": "repository", "event.type": "access"},
+        "action_source_field": "operation",
+        "action_mapping": {"get-file": "repo_read"},
+        "success_rate": 1.0,
+        "schema_mapping_rate": 1.0,
+        "shadow_replay_success_rate": 1.0,
+    }]}), encoding="utf-8")
+
+    result = run_pipeline([{
+        "source_id": "svn_test",
+        "source_type": "svn_test",
+        "record_mode": "line",
+        "include_raw_text": True,
+        "paths": [str(log_path)],
+    }], registry_path=registry_path)
+
+    event = result.normalized[0]
+    assert event["event"]["category"] == "repository"
+    assert event["event"]["type"] == "access"
+    assert event["event"]["action"] == "repo_read"
+    assert event["event"]["outcome"] == "success"

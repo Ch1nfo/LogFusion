@@ -4,8 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
-from logfusion.config import load_sources_config
+from logfusion.config import load_llm_config, load_sources_config
 from logfusion.parser_candidates import propose_parser_candidates
+from logfusion.llm_generation import generate_and_validate_llm_candidates, generate_llm_candidates
+from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
 from logfusion.parser_registry import ParserRegistryError, list_registry, register_candidates, set_parser_status
 from logfusion.parser_test_harness import run_registry_tests
 from logfusion.pipeline import run_pipeline
@@ -31,6 +33,16 @@ def main(argv: list[str] | None = None) -> int:
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
     propose_parser.add_argument("--output", required=True)
+    propose_parser.add_argument("--llm", action="store_true", help="Generate source-specific draft parsers with an LLM.")
+    propose_parser.add_argument("--llm-config", help="Local YAML provider configuration.")
+    propose_parser.add_argument("--registry")
+    propose_parser.add_argument("--auto-validate", action="store_true")
+    propose_parser.add_argument("--report-output")
+    propose_parser.add_argument("--llm-base-url")
+    propose_parser.add_argument("--llm-model")
+    propose_parser.add_argument("--llm-api-key-env")
+    propose_parser.add_argument("--llm-timeout", type=float)
+    propose_parser.add_argument("--llm-sample-limit", type=int)
 
     registry_parser = subparsers.add_parser("registry")
     registry_subparsers = registry_parser.add_subparsers(dest="registry_command", required=True)
@@ -94,7 +106,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "propose-parsers":
         unknown = _read_jsonl(Path(args.unknown_input))
-        candidates = propose_parser_candidates(unknown)
+        llm_settings = load_llm_config(Path(args.llm_config)) if args.llm_config else {}
+        llm_mode = args.llm or bool(args.llm_config)
+        if llm_mode and llm_settings.get("enabled") is False:
+            parser.error("LLM is disabled in --llm-config")
+        if args.auto_validate and (not llm_mode or not args.registry):
+            parser.error("--auto-validate requires LLM mode and --registry")
+        if llm_mode:
+            provider_name = llm_settings.get("provider", "openai_compatible")
+            if provider_name != "openai_compatible":
+                parser.error(f"Unsupported LLM provider: {provider_name}")
+            base_url = args.llm_base_url or llm_settings.get("base_url")
+            model = args.llm_model or llm_settings.get("model")
+            if not base_url or not model:
+                parser.error("LLM mode requires base_url and model in flags or --llm-config")
+            api_key_env = args.llm_api_key_env or llm_settings.get("api_key_env", "LOGFUSION_LLM_API_KEY")
+            timeout = args.llm_timeout or llm_settings.get("timeout_seconds", 30.0)
+            sample_limit = args.llm_sample_limit or llm_settings.get("sample_limit", 5)
+            provider = OpenAICompatibleProvider(
+                base_url,
+                model,
+                api_key_env,
+                timeout,
+            )
+            try:
+                if args.auto_validate:
+                    report = generate_and_validate_llm_candidates(
+                        unknown, Path(args.registry), provider, sample_limit,
+                    )
+                    candidates = report["candidates"]
+                else:
+                    candidates, report = generate_llm_candidates(unknown, provider, sample_limit)
+            except LLMProviderError as exc:
+                print(str(exc))
+                return 1
+            if args.report_output:
+                _write_json(Path(args.report_output), report)
+        else:
+            candidates = propose_parser_candidates(unknown)
         _write_jsonl(Path(args.output), candidates)
         return 0
     if args.command == "registry":

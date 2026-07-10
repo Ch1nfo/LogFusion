@@ -51,6 +51,9 @@ def raw_record_to_dict(record: RawRecord) -> dict:
         "size_bytes": record.size_bytes,
         "storage_ref": record.storage_ref,
         "include_raw_text": record.include_raw_text,
+        "product": record.product,
+        "format_version": record.format_version,
+        "llm_enabled": record.llm_enabled,
     }
 
 
@@ -68,4 +71,7 @@ def raw_record_from_dict(data: dict) -> RawRecord:
         size_bytes=int(data["size_bytes"]),
         storage_ref=data["storage_ref"],
         include_raw_text=bool(data.get("include_raw_text", True)),
+        product=data.get("product"),
+        format_version=data.get("format_version"),
+        llm_enabled=bool(data.get("llm_enabled", False)),
     )

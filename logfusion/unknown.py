@@ -31,6 +31,11 @@ def build_unknown_record(
     }
     if record.include_raw_text:
         raw["text"] = record.raw_text
+    if record.product:
+        raw["product"] = record.product
+    if record.format_version:
+        raw["format_version"] = record.format_version
+    raw["llm_enabled"] = record.llm_enabled
 
     unknown = {
         "unknown_id": unknown_id,
@@ -73,4 +78,3 @@ def template_hint(text: str) -> str:
     hint = re.sub(r"\b\d{2,}\b", "<NUM>", hint)
     hint = re.sub(r"=(?!<)([^\s]+)", "=<VAR>", hint)
     return hint[:500]
-
