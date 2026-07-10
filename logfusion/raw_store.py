@@ -55,6 +55,10 @@ def raw_record_to_dict(record: RawRecord) -> dict:
         "product": record.product,
         "format_version": record.format_version,
         "llm_enabled": record.llm_enabled,
+        "kafka_topic": record.kafka_topic,
+        "kafka_partition": record.kafka_partition,
+        "kafka_offset": record.kafka_offset,
+        "kafka_timestamp_ms": record.kafka_timestamp_ms,
     }
 
 
@@ -75,4 +79,12 @@ def raw_record_from_dict(data: dict) -> RawRecord:
         product=data.get("product"),
         format_version=data.get("format_version"),
         llm_enabled=bool(data.get("llm_enabled", False)),
+        kafka_topic=data.get("kafka_topic"),
+        kafka_partition=_optional_int(data.get("kafka_partition")),
+        kafka_offset=_optional_int(data.get("kafka_offset")),
+        kafka_timestamp_ms=_optional_int(data.get("kafka_timestamp_ms")),
     )
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if value is not None else None

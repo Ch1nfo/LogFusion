@@ -1,0 +1,20 @@
+# Copy to config/kafka.local.yaml, then set broker addresses and environment variables.
+kafka:
+  bootstrap_servers: kafka-1.example.internal:9092,kafka-2.example.internal:9092
+  group_id: logfusion-security
+  topics:
+    - raw.security.audit
+  source_id: security_audit_kafka
+  source_type: auto
+  product: security-audit
+  format_version: v1
+  include_raw_text: false
+  poll_timeout_seconds: 1.0
+  auto_offset_reset: earliest
+
+  # Optional TLS / SASL settings. Keep actual secrets in environment variables only.
+  security_protocol: SASL_SSL
+  sasl_mechanism: SCRAM-SHA-512
+  sasl_username_env: LOGFUSION_KAFKA_USERNAME
+  sasl_password_env: LOGFUSION_KAFKA_PASSWORD
+  ssl_ca_location: /etc/ssl/certs/ca-certificates.crt

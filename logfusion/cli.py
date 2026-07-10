@@ -5,7 +5,8 @@ import json
 import os
 from pathlib import Path
 
-from logfusion.config import load_llm_config, load_sources_config
+from logfusion.config import load_kafka_config, load_llm_config, load_sources_config
+from logfusion.kafka_source import KafkaConsumerError, run_kafka_streaming_pipeline
 from logfusion.parser_candidates import propose_parser_candidates
 from logfusion.llm_generation import generate_and_validate_llm_candidates, generate_llm_candidates
 from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
@@ -31,6 +32,20 @@ def main(argv: list[str] | None = None) -> int:
     parse_parser.add_argument("--checkpoint")
     parse_parser.add_argument("--checkpoint-every", type=int, default=10_000)
     parse_parser.add_argument("--resume", action="store_true")
+
+    consume_parser = subparsers.add_parser("consume")
+    consume_subparsers = consume_parser.add_subparsers(dest="consume_command", required=True)
+    kafka_consume_parser = consume_subparsers.add_parser("kafka")
+    kafka_consume_parser.add_argument("--config", required=True)
+    kafka_consume_parser.add_argument("--output", required=True)
+    kafka_consume_parser.add_argument("--unknown-output", default="output/kafka_unknown.jsonl")
+    kafka_consume_parser.add_argument("--summary-output", default="output/kafka_summary.json")
+    kafka_consume_parser.add_argument("--raw-store-output")
+    kafka_consume_parser.add_argument("--registry")
+    kafka_consume_parser.add_argument("--checkpoint")
+    kafka_consume_parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    kafka_consume_parser.add_argument("--resume", action="store_true")
+    kafka_consume_parser.add_argument("--once", action="store_true")
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -123,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc))
             return 1
         return 0
+    if args.command == "consume":
+        return _handle_consume(args)
     if args.command == "propose-parsers":
         unknown = _read_jsonl(Path(args.unknown_input))
         llm_settings = load_llm_config(Path(args.llm_config)) if args.llm_config else {}
@@ -249,6 +266,34 @@ def _handle_replay(args: argparse.Namespace) -> int:
         _write_json(Path(args.output), report)
         return 0
     return 2
+
+
+def _handle_consume(args: argparse.Namespace) -> int:
+    if args.consume_command != "kafka":
+        return 2
+    argument_error = _streaming_argument_error(args)
+    if argument_error:
+        print(argument_error)
+        return 2
+    try:
+        _protect_config_path(args)
+        config = load_kafka_config(Path(args.config))
+        run_kafka_streaming_pipeline(
+            config,
+            normalized_output=Path(args.output),
+            unknown_output=Path(args.unknown_output),
+            summary_output=Path(args.summary_output),
+            raw_output=Path(args.raw_store_output) if args.raw_store_output else None,
+            registry_path=Path(args.registry) if args.registry else None,
+            checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
+            checkpoint_every=args.checkpoint_every,
+            resume=args.resume,
+            stop_when_idle=args.once,
+        )
+    except (CheckpointError, KafkaConsumerError, ValueError) as exc:
+        print(str(exc))
+        return 1
+    return 0
 
 
 def _streaming_argument_error(args: argparse.Namespace) -> str | None:

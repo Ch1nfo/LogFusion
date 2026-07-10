@@ -20,3 +20,7 @@ class RawRecord:
     product: str | None = None
     format_version: str | None = None
     llm_enabled: bool = False
+    kafka_topic: str | None = None
+    kafka_partition: int | None = None
+    kafka_offset: int | None = None
+    kafka_timestamp_ms: int | None = None

@@ -88,6 +88,39 @@ def load_llm_config(path: Path) -> dict[str, Any]:
     return settings
 
 
+def load_kafka_config(path: Path) -> dict[str, Any]:
+    """Load the small YAML subset used by the Kafka consumer configuration."""
+    settings: dict[str, Any] = {}
+    in_kafka_section = False
+    in_topics = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "kafka:":
+            in_kafka_section = True
+            in_topics = False
+            continue
+        if not raw_line[0].isspace() and stripped.endswith(":"):
+            in_kafka_section = False
+            in_topics = False
+            continue
+        if not in_kafka_section:
+            continue
+        if stripped == "topics:":
+            settings["topics"] = []
+            in_topics = True
+            continue
+        if in_topics and stripped.startswith("- "):
+            settings["topics"].append(_value(stripped[2:]))
+            continue
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+            settings[key.strip()] = _typed_value(value)
+            in_topics = False
+    return settings
+
+
 def _value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:

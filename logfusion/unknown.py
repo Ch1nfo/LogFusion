@@ -35,6 +35,13 @@ def build_unknown_record(
         raw["product"] = record.product
     if record.format_version:
         raw["format_version"] = record.format_version
+    if record.kafka_topic is not None:
+        raw["kafka"] = {
+            "topic": record.kafka_topic,
+            "partition": record.kafka_partition,
+            "offset": record.kafka_offset,
+            "timestamp_ms": record.kafka_timestamp_ms,
+        }
     raw["llm_enabled"] = record.llm_enabled
 
     unknown = {

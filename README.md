@@ -2,7 +2,7 @@
 
 本地日志解析 MVP：把本地文件日志归一成 **Canonical Event v0**，无法识别的记录进入 unknown 池，并提供 parser 候选 → 注册 → 测试 → shadow → active 的完整生命周期，以及 raw 回放与版本对比。
 
-当前阶段**只做本地文件**，不做 Kafka。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
+当前阶段支持本地历史文件与 Kafka 实时消费。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
 
 ## 环境
 
@@ -18,6 +18,8 @@ conda run -n agent python -m pytest -q
 也可在仓库根目录直接 `python -m logfusion`（包在路径上即可）。
 
 依赖：Python 3.10+（运行时仅标准库；开发/测试见 `pyproject.toml` 的 `dev` 可选依赖）。
+
+Kafka 连接器是可选依赖：`conda run -n agent pip install -e ".[kafka]"`。没有 Kafka 或该依赖时，本地文件解析和所有 fake-consumer 测试仍可使用。
 
 **隐私：** `output/`、`data/`、根目录原始日志 dump、`.env` / 密钥类文件均在 `.gitignore` 中，默认不会进版本库。提交前请确认样例已脱敏。
 
@@ -72,6 +74,26 @@ conda run -n agent python -m logfusion parse \
 ```
 
 恢复时会校验数据源配置、Registry、输入文件元数据和输出路径，并把输出截断到最后一次成功 checkpoint 的字节位置。输入发生变化时会拒绝继续；压缩文件会重新扫描当前文件并跳过已提交记录。
+
+## Kafka 实时消费
+
+复制 `config/kafka.example.yaml` 为本地配置并设置凭据环境变量。每条 Kafka message 对应一条完整日志；运行时先将输出与 checkpoint 持久化，再同步提交 offset，因此采用至少一次语义。
+
+```bash
+export LOGFUSION_KAFKA_USERNAME='...'
+export LOGFUSION_KAFKA_PASSWORD='...'
+
+conda run -n agent python -m logfusion consume kafka \
+  --config config/kafka.local.yaml \
+  --output output/kafka_normalized.jsonl \
+  --unknown-output output/kafka_unknown.jsonl \
+  --summary-output output/kafka_summary.json \
+  --raw-store-output output/kafka_raw.jsonl \
+  --checkpoint output/kafka.checkpoint.json \
+  --checkpoint-every 10000
+```
+
+加 `--once` 可在一次空 poll 后退出，适合批量排空与调试；默认持续消费。Kafka 原始引用格式为 `kafka://<topic>/<partition>/<offset>`，并保留 topic、partition、offset 与 broker 时间戳。
 
 ## Parser 生命周期（unknown → active）
 
@@ -229,6 +251,7 @@ conda run -n agent python -m logfusion quality drift \
 | 命令 | 作用 |
 |------|------|
 | `parse` | 流式读取本地/压缩文件 → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
+| `consume kafka` | Kafka → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
 | `propose-parsers` | unknown → 启发式或 LLM draft parser 候选 |
 | `registry register-candidates` | 候选写入 registry |
 | `registry list` | 列出 registry 中的 parser |

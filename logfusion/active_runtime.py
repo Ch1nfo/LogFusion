@@ -167,6 +167,13 @@ def _base_active_event(record: RawRecord, parser: dict[str, Any]) -> dict[str, A
     }
     if record.include_raw_text:
         event["raw"]["text"] = record.raw_text
+    if record.kafka_topic is not None:
+        event["raw"]["kafka"] = {
+            "topic": record.kafka_topic,
+            "partition": record.kafka_partition,
+            "offset": record.kafka_offset,
+            "timestamp_ms": record.kafka_timestamp_ms,
+        }
     return event
 
 
