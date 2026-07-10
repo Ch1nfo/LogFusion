@@ -31,10 +31,11 @@ def write_raw_records(records: Iterable[RawRecord], output_path: Path) -> int:
 
 
 def iter_stored_raw_records(input_path: Path) -> Iterable[RawRecord]:
-    for line in input_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        yield raw_record_from_dict(json.loads(line))
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            yield raw_record_from_dict(json.loads(line))
 
 
 def raw_record_to_dict(record: RawRecord) -> dict:

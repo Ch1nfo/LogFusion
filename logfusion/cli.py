@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from logfusion.config import load_llm_config, load_sources_config
@@ -10,12 +11,10 @@ from logfusion.llm_generation import generate_and_validate_llm_candidates, gener
 from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
 from logfusion.parser_registry import ParserRegistryError, list_registry, register_candidates, set_parser_status
 from logfusion.parser_test_harness import run_registry_tests
-from logfusion.pipeline import run_pipeline
-from logfusion.pipeline import replay_raw_records
 from logfusion.quality_drift import detect_drift
-from logfusion.raw_store import write_raw_store
 from logfusion.replay_compare import compare_raw_replays
 from logfusion.shadow_replay import run_shadow_replay
+from logfusion.streaming import CheckpointError, run_streaming_pipeline, run_streaming_raw_replay
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,6 +28,9 @@ def main(argv: list[str] | None = None) -> int:
     parse_parser.add_argument("--summary-output", default="output/summary.json")
     parse_parser.add_argument("--registry")
     parse_parser.add_argument("--raw-store-output")
+    parse_parser.add_argument("--checkpoint")
+    parse_parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    parse_parser.add_argument("--resume", action="store_true")
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -86,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     replay_raw_parser.add_argument("--unknown-output", default="output/replay_unknown.jsonl")
     replay_raw_parser.add_argument("--summary-output", default="output/replay_summary.json")
     replay_raw_parser.add_argument("--registry")
+    replay_raw_parser.add_argument("--checkpoint")
+    replay_raw_parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    replay_raw_parser.add_argument("--resume", action="store_true")
 
     replay_compare_parser = replay_subparsers.add_parser("compare")
     replay_compare_parser.add_argument("--raw-input", required=True)
@@ -95,14 +100,28 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "parse":
-        sources = load_sources_config(Path(args.config))
-        registry_path = Path(args.registry) if args.registry else None
-        result = run_pipeline(sources, registry_path=registry_path)
-        if args.raw_store_output:
-            write_raw_store(sources, Path(args.raw_store_output))
-        _write_jsonl(Path(args.output), result.normalized)
-        _write_jsonl(Path(args.unknown_output), result.unknown)
-        _write_json(Path(args.summary_output), result.summary)
+        argument_error = _streaming_argument_error(args)
+        if argument_error:
+            print(argument_error)
+            return 2
+        try:
+            _protect_config_path(args)
+            sources = load_sources_config(Path(args.config))
+            registry_path = Path(args.registry) if args.registry else None
+            run_streaming_pipeline(
+                sources,
+                normalized_output=Path(args.output),
+                unknown_output=Path(args.unknown_output),
+                summary_output=Path(args.summary_output),
+                raw_output=Path(args.raw_store_output) if args.raw_store_output else None,
+                registry_path=registry_path,
+                checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
+                checkpoint_every=args.checkpoint_every,
+                resume=args.resume,
+            )
+        except CheckpointError as exc:
+            print(str(exc))
+            return 1
         return 0
     if args.command == "propose-parsers":
         unknown = _read_jsonl(Path(args.unknown_input))
@@ -203,11 +222,25 @@ def _handle_quality(args: argparse.Namespace) -> int:
 
 def _handle_replay(args: argparse.Namespace) -> int:
     if args.replay_command == "raw":
+        argument_error = _streaming_argument_error(args)
+        if argument_error:
+            print(argument_error)
+            return 2
         registry_path = Path(args.registry) if args.registry else None
-        result = replay_raw_records(Path(args.raw_input), registry_path=registry_path)
-        _write_jsonl(Path(args.output), result.normalized)
-        _write_jsonl(Path(args.unknown_output), result.unknown)
-        _write_json(Path(args.summary_output), result.summary)
+        try:
+            run_streaming_raw_replay(
+                raw_input=Path(args.raw_input),
+                normalized_output=Path(args.output),
+                unknown_output=Path(args.unknown_output),
+                summary_output=Path(args.summary_output),
+                registry_path=registry_path,
+                checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
+                checkpoint_every=args.checkpoint_every,
+                resume=args.resume,
+            )
+        except CheckpointError as exc:
+            print(str(exc))
+            return 1
         return 0
     if args.replay_command == "compare":
         baseline_registry = Path(args.baseline_registry) if args.baseline_registry else None
@@ -216,6 +249,38 @@ def _handle_replay(args: argparse.Namespace) -> int:
         _write_json(Path(args.output), report)
         return 0
     return 2
+
+
+def _streaming_argument_error(args: argparse.Namespace) -> str | None:
+    if args.resume and not args.checkpoint:
+        return "--resume requires --checkpoint"
+    if args.checkpoint_every <= 0:
+        return "--checkpoint-every must be greater than zero"
+    return None
+
+
+def _protect_config_path(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    writable_paths = [
+        Path(args.output),
+        Path(args.unknown_output),
+        Path(args.summary_output),
+    ]
+    if args.raw_store_output:
+        writable_paths.append(Path(args.raw_store_output))
+    if args.checkpoint:
+        writable_paths.append(Path(args.checkpoint))
+    if any(_same_path(path.resolve(), config_path) for path in writable_paths):
+        raise CheckpointError(f"config path conflicts with output or checkpoint: {config_path}")
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    if left == right:
+        return True
+    try:
+        return left.exists() and right.exists() and os.path.samefile(left, right)
+    except OSError:
+        return False
 
 
 def _read_jsonl(path: Path) -> list[dict]:

@@ -6,6 +6,7 @@ import hashlib
 import lzma
 import zipfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -13,11 +14,31 @@ from typing import Iterable, Iterator
 from logfusion.models import RawRecord
 
 
+@dataclass(frozen=True)
+class SourceFile:
+    unit_id: str
+    path: Path
+    source: dict
+
+
 def iter_raw_records(sources: list[dict]) -> Iterable[RawRecord]:
-    for source in sources:
-        for pattern in source.get("paths", []):
-            for file_name in sorted(glob(pattern)):
-                yield from _iter_file_records(Path(file_name), source)
+    for source_file in iter_source_files(sources):
+        yield from iter_source_file_records(source_file.path, source_file.source)
+
+
+def iter_source_files(sources: list[dict]) -> Iterable[SourceFile]:
+    for source_index, source in enumerate(sources):
+        for pattern_index, pattern in enumerate(source.get("paths", [])):
+            for match_index, file_name in enumerate(sorted(glob(pattern))):
+                yield SourceFile(
+                    unit_id=f"local:{source_index}:{pattern_index}:{match_index}",
+                    path=Path(file_name),
+                    source=source,
+                )
+
+
+def iter_source_file_records(path: Path, source: dict) -> Iterable[RawRecord]:
+    yield from _iter_file_records(path, source)
 
 
 def _iter_file_records(path: Path, source: dict) -> Iterable[RawRecord]:

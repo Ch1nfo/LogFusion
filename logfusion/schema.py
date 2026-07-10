@@ -38,9 +38,10 @@ def validate_event(event: dict[str, Any]) -> list[str]:
         if value is None or value == "":
             errors.append(f"{field_path} is required")
     confidence = _get_path(event, "parser.confidence")
-    if confidence is not None and not isinstance(confidence, int | float):
+    is_numeric_confidence = type(confidence) in (int, float)
+    if confidence is not None and not is_numeric_confidence:
         errors.append("parser.confidence must be numeric")
-    if isinstance(confidence, int | float) and not 0 <= confidence <= 1:
+    if is_numeric_confidence and not 0 <= confidence <= 1:
         errors.append("parser.confidence must be between 0 and 1")
     _validate_enum(errors, event, "event.category", EVENT_CATEGORIES)
     _validate_enum(errors, event, "event.type", EVENT_TYPES)

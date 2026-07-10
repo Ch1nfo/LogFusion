@@ -45,6 +45,34 @@ conda run -n agent python -m logfusion parse \
 | `output/summary.json` | 成功率、置信度、字段覆盖率等质量摘要 |
 | `output/raw_records.jsonl` | 原始记录落盘，供后续 replay / compare |
 
+`parse` 默认使用固定内存的流式链路：每条记录只经过一次读取，随后直接写入 normalized、unknown 和可选 raw store，不会把整批事件保留在内存。`.gz`、`.bz2`、`.xz` / `.lzma` 和 `.zip` 历史文件使用同一条链路。
+
+百 GB 级文件建议开启 checkpoint：
+
+```bash
+conda run -n agent python -m logfusion parse \
+  --config config/sources.yaml \
+  --output output/normalized.jsonl \
+  --unknown-output output/unknown.jsonl \
+  --summary-output output/summary.json \
+  --raw-store-output output/raw_records.jsonl \
+  --checkpoint output/parse.checkpoint.json \
+  --checkpoint-every 10000
+
+# 中断后使用完全相同的配置、registry、输入和输出路径恢复
+conda run -n agent python -m logfusion parse \
+  --config config/sources.yaml \
+  --output output/normalized.jsonl \
+  --unknown-output output/unknown.jsonl \
+  --summary-output output/summary.json \
+  --raw-store-output output/raw_records.jsonl \
+  --checkpoint output/parse.checkpoint.json \
+  --checkpoint-every 10000 \
+  --resume
+```
+
+恢复时会校验数据源配置、Registry、输入文件元数据和输出路径，并把输出截断到最后一次成功 checkpoint 的字节位置。输入发生变化时会拒绝继续；压缩文件会重新扫描当前文件并跳过已提交记录。
+
 ## Parser 生命周期（unknown → active）
 
 用 unknown 样例走一遍完整路径：
@@ -137,7 +165,8 @@ conda run -n agent python -m logfusion replay raw \
   --registry output/parser_registry.json \
   --output output/replayed_normalized.jsonl \
   --unknown-output output/replayed_unknown.jsonl \
-  --summary-output output/replayed_summary.json
+  --summary-output output/replayed_summary.json \
+  --checkpoint output/replay.checkpoint.json
 
 # baseline vs current 对比
 conda run -n agent python -m logfusion replay compare \
@@ -199,14 +228,14 @@ conda run -n agent python -m logfusion quality drift \
 
 | 命令 | 作用 |
 |------|------|
-| `parse` | 本地文件 → normalized / unknown / summary（可选 raw store、registry） |
+| `parse` | 流式读取本地/压缩文件 → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
 | `propose-parsers` | unknown → 启发式或 LLM draft parser 候选 |
 | `registry register-candidates` | 候选写入 registry |
 | `registry list` | 列出 registry 中的 parser |
 | `registry set-status` | 受控状态流转 |
 | `registry test` | Parser Test Harness |
 | `registry replay` | Shadow replay |
-| `replay raw` | 从 raw store 重放 |
+| `replay raw` | 流式从 raw store 重放（可选 checkpoint） |
 | `replay compare` | 两套 registry 的 replay 对比 |
 | `quality drift` | summary 级漂移检测 |
 
@@ -235,7 +264,8 @@ LogFusion/
 | `parsers.py` | 手写源解析器（svn/sso/gitlab/hiklink） |
 | `schema.py` | Canonical Event v0 校验 |
 | `unknown.py` | unknown 记录构造 |
-| `pipeline.py` | 主解析 / raw 回放流水线 |
+| `pipeline.py` | 单记录解析核心与小数据兼容包装器 |
+| `streaming.py` | JSONL sink、增量质量统计编排与 checkpoint / resume |
 | `raw_store.py` | raw JSONL 读写 |
 | `quality.py` / `quality_drift.py` | 质量摘要与漂移 |
 | `parser_candidates.py` | 从 unknown 提出 draft 候选 |
