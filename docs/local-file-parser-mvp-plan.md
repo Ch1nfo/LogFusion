@@ -6,26 +6,28 @@
 
 **Runtime:** `conda run -n agent python ...`
 
+**Status:** ✅ Complete (Phase 1 / MVP)
+
 ## Tasks
 
-1. Create split sample data under `data/svn`, `data/sso`, `data/gitlab`, and `data/hiklink`.
-2. Add tests for file record framing, parser routing, source-specific mappings, unknown handling, and CLI output.
-3. Implement the minimal Python package under `src/logfusion`.
-4. Run tests with `conda run -n agent python -m pytest`.
-5. Run the CLI against `config/sources.yaml` and inspect JSONL output.
-6. Add raw integrity metadata and optional raw text control.
-7. Add Canonical Event v0 validation, structured unknown output, and parse quality summary.
-8. Add parser candidate proposal interface for unknown records without calling a real LLM.
-9. Add Parser Registry v0 backed by a local JSON file, including candidate registration, listing, and guarded status transitions.
-10. Add Parser Test Harness for registered candidates and require passing tests before `shadow`.
-11. Add Shadow Parser Replay and require successful replay before `active`.
-12. Add Active Parser Runtime as a fallback after handwritten parsers and before unknown routing.
-13. Add Generic Parser Runtime for `key_value`, `json`, and `regex` registry parsers.
-14. Add active parser conflict resolution and conflict metadata.
-15. Enhance Canonical Schema v0 with enums, type checks, and raw reference validation.
-16. Enhance parse quality summary and add parser drift detection from baseline/current summaries.
-17. Add local raw JSONL storage and replay re-normalization.
-18. Add parser version replay compare using the same raw store and two registry states.
+1. [x] Create split sample data under `data/svn`, `data/sso`, `data/gitlab`, and `data/hiklink`.
+2. [x] Add tests for file record framing, parser routing, source-specific mappings, unknown handling, and CLI output.
+3. [x] Implement the minimal Python package under `logfusion/` (plan originally said `src/logfusion`; package lives at repo root).
+4. [x] Run tests with `conda run -n agent python -m pytest`.
+5. [x] Run the CLI against `config/sources.yaml` and inspect JSONL output.
+6. [x] Add raw integrity metadata and optional raw text control.
+7. [x] Add Canonical Event v0 validation, structured unknown output, and parse quality summary.
+8. [x] Add parser candidate proposal interface for unknown records without calling a real LLM.
+9. [x] Add Parser Registry v0 backed by a local JSON file, including candidate registration, listing, and guarded status transitions.
+10. [x] Add Parser Test Harness for registered candidates and require passing tests before `shadow`.
+11. [x] Add Shadow Parser Replay and require successful shadow replay before `active`.
+12. [x] Add Active Parser Runtime as a fallback after handwritten parsers and before unknown routing.
+13. [x] Add Generic Parser Runtime for `key_value`, `json`, and `regex` registry parsers.
+14. [x] Add active parser conflict resolution and conflict metadata.
+15. [x] Enhance Canonical Schema v0 with enums, type checks, and raw reference validation.
+16. [x] Enhance parse quality summary and add parser drift detection from baseline/current summaries.
+17. [x] Add local raw JSONL storage and replay re-normalization.
+18. [x] Add parser version replay compare using the same raw store and two registry states.
 
 ## Constraints
 
@@ -46,3 +48,22 @@
 - Drift detection must compare parse summaries and flag parse success drops, unknown template spikes, confidence drops, and required field coverage drops.
 - Raw replay must parse stored raw records with the current parser/runtime/registry and produce fresh normalized, unknown, and summary outputs.
 - Replay compare must align records by `raw.record_id` and report summary deltas plus record-level parser/output changes.
+
+## Phase 2 — LLM-assisted propose-parsers
+
+**Goal:** Optionally call a real LLM from `propose-parsers` to improve draft `suggested_parser` quality, while keeping heuristics as the offline default and never putting LLM calls on the hot parse path.
+
+**Status:** 🟡 Design in progress (not implemented)
+
+### Intended outcomes
+
+- CLI can request LLM-backed proposals (opt-in flag / config).
+- LLM output is validated and still emitted only as `draft` candidates.
+- Existing registry → test → shadow → active gates remain unchanged.
+- Secrets (API keys) stay out of git; local-only config / env.
+
+### Out of scope for Phase 2
+
+- Kafka / remote ingestion
+- Auto-activating LLM-generated parsers
+- ECS / OCSF export adapters
