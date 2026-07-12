@@ -5,13 +5,16 @@ import json
 import os
 from pathlib import Path
 
-from logfusion.config import load_kafka_config, load_llm_config, load_sources_config
+from logfusion.config import load_detection_policy, load_fusion_policy, load_kafka_config, load_llm_config, load_sources_config
 from logfusion.baseline import BaselineEngine, BaselineError, query_baseline_state
+from logfusion.cases import CaseEngine, CaseError, get_case, list_cases
 from logfusion.correlation import CorrelationEngine, CorrelationError, query_incident_state
-from logfusion.detection import DetectionEngine, DetectionError, query_detection_state
+from logfusion.detection import DetectionConfig, DetectionEngine, DetectionError, query_detection_state
 from logfusion.features import FeatureError, build_features_from_jsonl, query_feature_state
-from logfusion.fusion import FusionEngine, FusionError, query_risk_state
+from logfusion.fusion import FusionConfig, FusionEngine, FusionError, query_risk_state
+from logfusion.orchestrator import OrchestratorConfig, OrchestratorError, run_continuous_pipeline
 from logfusion.kafka_source import KafkaConsumerError, run_kafka_streaming_pipeline
+from logfusion.kafka_ueba import run_kafka_ueba_pipeline
 from logfusion.parser_candidates import propose_parser_candidates
 from logfusion.llm_generation import generate_and_validate_llm_candidates, generate_llm_candidates
 from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
@@ -52,6 +55,24 @@ def main(argv: list[str] | None = None) -> int:
     kafka_consume_parser.add_argument("--resume", action="store_true")
     kafka_consume_parser.add_argument("--once", action="store_true")
 
+    kafka_ueba_parser = consume_subparsers.add_parser("kafka-ueba")
+    kafka_ueba_parser.add_argument("--config", required=True)
+    kafka_ueba_parser.add_argument("--output", required=True)
+    kafka_ueba_parser.add_argument("--unknown-output", default="output/kafka_unknown.jsonl")
+    kafka_ueba_parser.add_argument("--summary-output", default="output/kafka_summary.json")
+    kafka_ueba_parser.add_argument("--raw-store-output")
+    kafka_ueba_parser.add_argument("--registry")
+    kafka_ueba_parser.add_argument("--checkpoint")
+    kafka_ueba_parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    kafka_ueba_parser.add_argument("--resume", action="store_true")
+    kafka_ueba_parser.add_argument("--once", action="store_true")
+    kafka_ueba_parser.add_argument("--feature-state", required=True)
+    kafka_ueba_parser.add_argument("--baseline-state", required=True)
+    kafka_ueba_parser.add_argument("--detection-state", required=True)
+    kafka_ueba_parser.add_argument("--incident-state", required=True)
+    kafka_ueba_parser.add_argument("--risk-state", required=True)
+    kafka_ueba_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
+
     features_parser = subparsers.add_parser("features")
     features_subparsers = features_parser.add_subparsers(dest="features_command", required=True)
     features_build_parser = features_subparsers.add_parser("build")
@@ -82,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     detect_run_parser.add_argument("--feature-state", required=True)
     detect_run_parser.add_argument("--baseline-state", required=True)
     detect_run_parser.add_argument("--state", required=True)
+    detect_run_parser.add_argument("--policy-config")
     detect_query_parser = detect_subparsers.add_parser("query")
     detect_query_parser.add_argument("--state", required=True)
     detect_query_parser.add_argument("--user", required=True)
@@ -106,11 +128,69 @@ def main(argv: list[str] | None = None) -> int:
     fuse_run_parser.add_argument("--detection-state", required=True)
     fuse_run_parser.add_argument("--incident-state", required=True)
     fuse_run_parser.add_argument("--state", required=True)
+    fuse_run_parser.add_argument("--policy-config")
+    fuse_run_parser.add_argument("--case-state")
+    fuse_run_parser.add_argument("--refresh-policy", action="store_true")
     fuse_query_parser = fuse_subparsers.add_parser("query")
     fuse_query_parser.add_argument("--state", required=True)
     fuse_query_parser.add_argument("--user", required=True)
     fuse_query_parser.add_argument("--from", dest="from_time", required=True)
     fuse_query_parser.add_argument("--to", dest="to_time", required=True)
+
+    orchestrate_parser = subparsers.add_parser("orchestrate")
+    orchestrate_subparsers = orchestrate_parser.add_subparsers(dest="orchestrate_command", required=True)
+    orchestrate_run_parser = orchestrate_subparsers.add_parser("run")
+    orchestrate_run_parser.add_argument("--input", required=True, help="Append-only normalized JSONL input.")
+    orchestrate_run_parser.add_argument("--feature-state", required=True)
+    orchestrate_run_parser.add_argument("--baseline-state", required=True)
+    orchestrate_run_parser.add_argument("--detection-state", required=True)
+    orchestrate_run_parser.add_argument("--incident-state", required=True)
+    orchestrate_run_parser.add_argument("--risk-state", required=True)
+    orchestrate_run_parser.add_argument("--checkpoint")
+    orchestrate_run_parser.add_argument("--resume", action="store_true")
+    orchestrate_run_parser.add_argument("--batch-size", type=int, default=1_000)
+    orchestrate_run_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
+    orchestrate_run_parser.add_argument("--no-downstream", action="store_true")
+
+    cases_parser = subparsers.add_parser("cases")
+    cases_subparsers = cases_parser.add_subparsers(dest="cases_command", required=True)
+    cases_sync_parser = cases_subparsers.add_parser("sync")
+    cases_sync_parser.add_argument("--risk-state", required=True)
+    cases_sync_parser.add_argument("--state", required=True)
+    cases_list_parser = cases_subparsers.add_parser("list")
+    cases_list_parser.add_argument("--state", required=True)
+    cases_list_parser.add_argument("--user")
+    cases_list_parser.add_argument("--status")
+    cases_show_parser = cases_subparsers.add_parser("show")
+    cases_show_parser.add_argument("--state", required=True)
+    cases_show_parser.add_argument("--case-id", required=True)
+    cases_transition_parser = cases_subparsers.add_parser("transition")
+    cases_transition_parser.add_argument("--risk-state", required=True)
+    cases_transition_parser.add_argument("--state", required=True)
+    cases_transition_parser.add_argument("--case-id", required=True)
+    cases_transition_parser.add_argument("--status", required=True)
+    cases_transition_parser.add_argument("--actor", required=True)
+    cases_transition_parser.add_argument("--note")
+    cases_transition_parser.add_argument("--suppression-until")
+    cases_assign_parser = cases_subparsers.add_parser("assign")
+    cases_assign_parser.add_argument("--risk-state", required=True)
+    cases_assign_parser.add_argument("--state", required=True)
+    cases_assign_parser.add_argument("--case-id", required=True)
+    cases_assign_parser.add_argument("--owner")
+    cases_assign_parser.add_argument("--actor", required=True)
+    cases_assign_parser.add_argument("--note")
+    cases_comment_parser = cases_subparsers.add_parser("comment")
+    cases_comment_parser.add_argument("--risk-state", required=True)
+    cases_comment_parser.add_argument("--state", required=True)
+    cases_comment_parser.add_argument("--case-id", required=True)
+    cases_comment_parser.add_argument("--actor", required=True)
+    cases_comment_parser.add_argument("--note", required=True)
+    cases_tags_parser = cases_subparsers.add_parser("set-tags")
+    cases_tags_parser.add_argument("--risk-state", required=True)
+    cases_tags_parser.add_argument("--state", required=True)
+    cases_tags_parser.add_argument("--case-id", required=True)
+    cases_tags_parser.add_argument("--actor", required=True)
+    cases_tags_parser.add_argument("--tag", action="append", required=True)
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -215,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_correlate(args)
     if args.command == "fuse":
         return _handle_fuse(args)
+    if args.command == "orchestrate":
+        return _handle_orchestrate(args)
+    if args.command == "cases":
+        return _handle_cases(args)
     if args.command == "propose-parsers":
         unknown = _read_jsonl(Path(args.unknown_input))
         llm_settings = load_llm_config(Path(args.llm_config)) if args.llm_config else {}
@@ -344,7 +428,7 @@ def _handle_replay(args: argparse.Namespace) -> int:
 
 
 def _handle_consume(args: argparse.Namespace) -> int:
-    if args.consume_command != "kafka":
+    if args.consume_command not in {"kafka", "kafka-ueba"}:
         return 2
     argument_error = _streaming_argument_error(args)
     if argument_error:
@@ -353,18 +437,28 @@ def _handle_consume(args: argparse.Namespace) -> int:
     try:
         _protect_config_path(args)
         config = load_kafka_config(Path(args.config))
-        run_kafka_streaming_pipeline(
-            config,
-            normalized_output=Path(args.output),
-            unknown_output=Path(args.unknown_output),
-            summary_output=Path(args.summary_output),
-            raw_output=Path(args.raw_store_output) if args.raw_store_output else None,
-            registry_path=Path(args.registry) if args.registry else None,
-            checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
-            checkpoint_every=args.checkpoint_every,
-            resume=args.resume,
-            stop_when_idle=args.once,
-        )
+        common = {
+            "normalized_output": Path(args.output),
+            "unknown_output": Path(args.unknown_output),
+            "summary_output": Path(args.summary_output),
+            "raw_output": Path(args.raw_store_output) if args.raw_store_output else None,
+            "registry_path": Path(args.registry) if args.registry else None,
+            "checkpoint_path": Path(args.checkpoint) if args.checkpoint else None,
+            "checkpoint_every": args.checkpoint_every,
+            "resume": args.resume,
+            "stop_when_idle": args.once,
+        }
+        if args.consume_command == "kafka":
+            run_kafka_streaming_pipeline(config, **common)
+        else:
+            run_kafka_ueba_pipeline(
+                config,
+                feature_state=Path(args.feature_state), baseline_state=Path(args.baseline_state),
+                detection_state=Path(args.detection_state), incident_state=Path(args.incident_state),
+                risk_state=Path(args.risk_state),
+                orchestrator_config=OrchestratorConfig(watermark_lag_seconds=args.watermark_lag_seconds),
+                **common,
+            )
     except (CheckpointError, KafkaConsumerError, ValueError) as exc:
         print(str(exc))
         return 1
@@ -410,7 +504,8 @@ def _handle_baseline(args: argparse.Namespace) -> int:
 def _handle_detect(args: argparse.Namespace) -> int:
     try:
         if args.detect_command == "run":
-            with DetectionEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.state)) as engine:
+            settings = load_detection_policy(Path(args.policy_config)) if args.policy_config else {}
+            with DetectionEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.state), DetectionConfig(**settings)) as engine:
                 report = engine.run()
         elif args.detect_command == "query":
             report = query_detection_state(Path(args.state), args.user, args.from_time, args.to_time)
@@ -442,13 +537,64 @@ def _handle_correlate(args: argparse.Namespace) -> int:
 def _handle_fuse(args: argparse.Namespace) -> int:
     try:
         if args.fuse_command == "run":
-            with FusionEngine(Path(args.detection_state), Path(args.incident_state), Path(args.state)) as engine:
-                report = engine.run()
+            settings = load_fusion_policy(Path(args.policy_config)) if args.policy_config else {}
+            with FusionEngine(
+                Path(args.detection_state), Path(args.incident_state), Path(args.state), FusionConfig(**settings),
+                Path(args.case_state) if args.case_state else None,
+            ) as engine:
+                report = engine.run(refresh_policy=args.refresh_policy)
         elif args.fuse_command == "query":
             report = query_risk_state(Path(args.state), args.user, args.from_time, args.to_time)
         else:
             return 2
     except FusionError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_orchestrate(args: argparse.Namespace) -> int:
+    if args.orchestrate_command != "run":
+        return 2
+    try:
+        report = run_continuous_pipeline(
+            args.input, args.feature_state, args.baseline_state, args.detection_state,
+            args.incident_state, args.risk_state,
+            checkpoint_path=args.checkpoint,
+            resume=args.resume,
+            config=OrchestratorConfig(args.batch_size, args.watermark_lag_seconds),
+            run_downstream=not args.no_downstream,
+        )
+    except (OrchestratorError, FeatureError) as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_cases(args: argparse.Namespace) -> int:
+    try:
+        if args.cases_command == "sync":
+            with CaseEngine(Path(args.risk_state), Path(args.state)) as engine:
+                report = engine.sync()
+        elif args.cases_command == "list":
+            report = list_cases(Path(args.state), args.user, args.status)
+        elif args.cases_command == "show":
+            report = get_case(Path(args.state), args.case_id)
+        elif args.cases_command in {"transition", "assign", "comment", "set-tags"}:
+            with CaseEngine(Path(args.risk_state), Path(args.state)) as engine:
+                if args.cases_command == "transition":
+                    report = engine.transition(args.case_id, args.status, args.actor, args.note, args.suppression_until)
+                elif args.cases_command == "assign":
+                    report = engine.assign(args.case_id, args.owner, args.actor, args.note)
+                elif args.cases_command == "comment":
+                    report = engine.comment(args.case_id, args.actor, args.note)
+                else:
+                    report = engine.set_tags(args.case_id, args.tag, args.actor)
+        else:
+            return 2
+    except CaseError as exc:
         print(str(exc))
         return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))

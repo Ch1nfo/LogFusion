@@ -27,6 +27,7 @@ class FusionConfig:
     detector_bonus: int = 3
     detector_bonus_cap: int = 10
     per_user_daily_alert_limit: int = 3
+    case_suppression_enabled: bool = True
 
     def fingerprint(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -42,6 +43,7 @@ class FusionEngine:
         incident_state: Path | str,
         risk_state: Path | str,
         config: FusionConfig | None = None,
+        case_state: Path | str | None = None,
     ) -> None:
         self.detection_path = Path(detection_state)
         self.incident_path = Path(incident_state)
@@ -50,10 +52,12 @@ class FusionEngine:
         self.risk_path = Path(risk_state)
         self.risk_path.parent.mkdir(parents=True, exist_ok=True)
         self.config = config or FusionConfig()
+        self.case_path = Path(case_state) if case_state is not None else None
         if not 0 <= self.config.alert_threshold <= 100 or not 0 <= self.config.critical_threshold <= 100:
             raise FusionError("risk thresholds must be between 0 and 100")
         self.detection = _readonly(self.detection_path)
         self.incidents = _readonly(self.incident_path)
+        self.cases = _readonly(self.case_path) if self.case_path is not None else None
         self.connection = sqlite3.connect(self.risk_path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -66,6 +70,8 @@ class FusionEngine:
     def close(self) -> None:
         self.detection.close()
         self.incidents.close()
+        if self.cases is not None:
+            self.cases.close()
         self.connection.close()
 
     def __enter__(self) -> FusionEngine:
@@ -74,13 +80,13 @@ class FusionEngine:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def run(self) -> dict[str, Any]:
+    def run(self, refresh_policy: bool = False) -> dict[str, Any]:
         detection_revision = int(_meta_map(self.detection, "detection_meta").get("last_consumed_feature_revision", "0"))
         correlation_revision = int(_meta_map(self.incidents, "correlation_meta").get("last_consumed_detection_revision", "0"))
         if correlation_revision != detection_revision:
             raise FusionError("Incident DB is behind Detection DB; run correlate run first")
         previous_revision = self._meta_int("last_consumed_correlation_revision", 0)
-        if previous_revision == correlation_revision:
+        if previous_revision == correlation_revision and not refresh_policy:
             return {
                 "processed_correlation_revision": correlation_revision,
                 "assessment_count": 0,
@@ -111,6 +117,9 @@ class FusionEngine:
                 user_day = (assessment["user_name"], assessment["first_seen"] // 86_400_000)
                 if assessment["risk_score"] < self.config.alert_threshold:
                     action = "below_threshold"
+                elif self._case_suppressed(assessment["user_name"], assessment["incident_type"], assessment["first_seen"]):
+                    action = "suppressed_by_case_policy"
+                    suppressed_count += 1
                 elif per_user_day.get(user_day, 0) >= self.config.per_user_daily_alert_limit:
                     action = "suppressed_budget"
                     suppressed_count += 1
@@ -120,6 +129,8 @@ class FusionEngine:
                     alert_count += 1
                 assessment["policy_action"] = action
                 assessment["supersedes_assessment_id"] = previous.get(assessment["assessment_key"])
+                if assessment["supersedes_assessment_id"] == assessment["assessment_id"]:
+                    assessment["supersedes_assessment_id"] = None
                 self._insert_assessment(assessment)
                 if action == "alert":
                     self._insert_alert(assessment, correlation_revision)
@@ -131,6 +142,17 @@ class FusionEngine:
             "suppressed_count": suppressed_count,
             "superseded_count": superseded_assessments + superseded_alerts,
         }
+
+    def _case_suppressed(self, user_name: str, incident_type: str, first_seen: int) -> bool:
+        if self.cases is None or not self.config.case_suppression_enabled:
+            return False
+        day = first_seen // 86_400_000
+        key = hashlib.sha256(f"{user_name}:{incident_type}:{day}".encode("utf-8")).hexdigest()
+        row = self.cases.execute(
+            "SELECT 1 FROM cases WHERE alert_key = ? AND status = 'suppressed' AND suppression_until > ?",
+            (key, _now_ms()),
+        ).fetchone()
+        return row is not None
 
     def query(self, user_name: str, start: str | int | datetime, end: str | int | datetime) -> dict[str, Any]:
         start_ms, end_ms = _timestamp_ms(start), _timestamp_ms(end)
@@ -191,7 +213,8 @@ class FusionEngine:
         }
 
     def _insert_assessment(self, assessment: dict[str, Any]) -> None:
-        self.connection.execute(
+        try:
+            self.connection.execute(
             """
             INSERT INTO risk_assessments(
                 assessment_id, assessment_key, incident_id, incident_key, user_name,
@@ -207,25 +230,52 @@ class FusionEngine:
                 json.dumps(assessment["risk_breakdown"], ensure_ascii=False, sort_keys=True), assessment["policy_action"],
                 assessment["source_correlation_revision"], assessment["supersedes_assessment_id"], _now_ms(), _now_ms(),
             ),
-        )
+            )
+        except sqlite3.IntegrityError:
+            # A policy-only refresh intentionally reuses the same correlation revision.
+            self.connection.execute(
+                """
+                UPDATE risk_assessments SET incident_id = ?, incident_key = ?, user_name = ?, first_seen = ?, last_seen = ?,
+                    incident_type = ?, base_score = ?, risk_score = ?, severity = ?, risk_breakdown_json = ?, policy_action = ?,
+                    status = 'active', supersedes_assessment_id = ?, updated_at = ?
+                WHERE assessment_key = ? AND source_correlation_revision = ?
+                """,
+                (
+                    assessment["incident_id"], assessment["incident_key"], assessment["user_name"], assessment["first_seen"],
+                    assessment["last_seen"], assessment["incident_type"], assessment["base_score"], assessment["risk_score"],
+                    assessment["severity"], json.dumps(assessment["risk_breakdown"], ensure_ascii=False, sort_keys=True),
+                    assessment["policy_action"], assessment["supersedes_assessment_id"], _now_ms(),
+                    assessment["assessment_key"], assessment["source_correlation_revision"],
+                ),
+            )
 
     def _insert_alert(self, assessment: dict[str, Any], revision: int) -> None:
         day = assessment["first_seen"] // 86_400_000
         alert_key = hashlib.sha256(f"{assessment['user_name']}:{assessment['incident_type']}:{day}".encode("utf-8")).hexdigest()
         alert_id = hashlib.sha256(f"{alert_key}:{revision}:{assessment['assessment_id']}".encode("utf-8")).hexdigest()
-        self.connection.execute(
-            """
+        try:
+            self.connection.execute(
+                """
             INSERT INTO alerts(
                 alert_id, alert_key, assessment_id, incident_id, user_name, first_seen, last_seen,
                 risk_score, severity, policy_reason, source_correlation_revision, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'threshold_and_budget', ?, 'active', ?, ?)
             """,
-            (
+                (
                 alert_id, alert_key, assessment["assessment_id"], assessment["incident_id"], assessment["user_name"],
                 assessment["first_seen"], assessment["last_seen"], assessment["risk_score"], assessment["severity"],
                 revision, _now_ms(), _now_ms(),
-            ),
-        )
+                ),
+            )
+        except sqlite3.IntegrityError:
+            self.connection.execute(
+                """
+                UPDATE alerts SET incident_id = ?, user_name = ?, first_seen = ?, last_seen = ?, risk_score = ?,
+                    severity = ?, status = 'active', updated_at = ? WHERE alert_id = ?
+                """,
+                (assessment["incident_id"], assessment["user_name"], assessment["first_seen"], assessment["last_seen"],
+                 assessment["risk_score"], assessment["severity"], _now_ms(), alert_id),
+            )
 
     def _verify_inputs(self) -> None:
         detection_meta = _meta_map(self.detection, "detection_meta")

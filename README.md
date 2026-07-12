@@ -95,6 +95,26 @@ conda run -n agent python -m logfusion consume kafka \
 
 加 `--once` 可在一次空 poll 后退出，适合批量排空与调试；默认持续消费。Kafka 原始引用格式为 `kafka://<topic>/<partition>/<offset>`，并保留 topic、partition、offset 与 broker 时间戳。
 
+如需直接运行完整实时 UEBA 链路，而不是只写入 normalized JSONL，可使用 `kafka-ueba`：
+
+```bash
+conda run -n agent python -m logfusion consume kafka-ueba \
+  --config config/kafka.local.yaml \
+  --output output/kafka_normalized.jsonl \
+  --unknown-output output/kafka_unknown.jsonl \
+  --summary-output output/kafka_summary.json \
+  --raw-store-output output/kafka_raw.jsonl \
+  --feature-state output/features.db \
+  --baseline-state output/baseline.db \
+  --detection-state output/detection.db \
+  --incident-state output/incidents.db \
+  --risk-state output/risk.db \
+  --checkpoint output/kafka_ueba.checkpoint.json \
+  --checkpoint-every 10000
+```
+
+每个提交批次会先持久化 raw/normalized 输出、Feature 状态、watermark、Baseline、Detection、Correlation 与 Fusion，再写本地 checkpoint，最后才同步提交 Kafka offset。若崩溃发生在 checkpoint 与 broker commit 之间，恢复时会从本地 checkpoint seek 并补交 offset；如果崩溃更早则允许 Kafka 重放，依靠稳定的 `event.id` 保持聚合和告警幂等。
+
 ## Session + Feature v1
 
 规范化事件可进一步按完全相同的 `user.name` 聚合为固定时间窗口和跨系统行为会话，为下一阶段行为基线提供确定性状态。状态保存到本地 SQLite；它不做账号别名合并或异常判定。
@@ -195,6 +215,71 @@ conda run -n agent python -m logfusion fuse query \
 ```
 
 首版风险分为 Incident 聚合分，加上跨来源系统奖励 10 分，以及每多一种检测器 3 分（总计最多 10 分），最高 100 分。`80+` 进入告警策略、`90+` 为 `critical`；每个用户每天默认最多产生 3 条告警，超过预算的高风险评估保留为 `suppressed_budget`，低于门槛的保留为 `below_threshold`。输入 revision 更新时，旧风险评估和告警标记为 `superseded`，新版本保留明确的替代链。该模块尚不引入资产、部门、身份图谱或外部 SOC 推送。
+
+风险策略可通过本地 YAML 调整；策略指纹受 Risk DB 保护，改变后需重建 Risk DB，避免静默改变历史告警语义：
+
+```yaml
+# config/fusion.local.yaml
+fusion:
+  alert_threshold: 80
+  critical_threshold: 90
+  per_user_daily_alert_limit: 3
+  case_suppression_enabled: true
+```
+
+Case 被标记为仍有效的 `suppressed` 后，执行一次策略刷新即可保留风险评估、撤销对应 active alert，并标记 `suppressed_by_case_policy`：
+
+```bash
+logfusion fuse run --detection-state output/detection.db --incident-state output/incidents.db \
+  --state output/risk.db --case-state output/cases.db \
+  --policy-config config/fusion.local.yaml --refresh-policy
+```
+
+## Continuous UEBA Orchestrator v1
+
+编排器将已经解析完成的追加式 normalized JSONL 接入 Feature、Baseline、Detection、Correlation 和 Risk Fusion。它以 `event.id` 幂等处理重放，使用 checkpoint 保存已提交字节位置和已提交内容的 SHA-256；只有下游整条链路成功后才推进 checkpoint。
+
+```bash
+conda run -n agent python -m logfusion orchestrate run \
+  --input output/normalized.jsonl \
+  --feature-state output/features.db \
+  --baseline-state output/baseline.db \
+  --detection-state output/detection.db \
+  --incident-state output/incidents.db \
+  --risk-state output/risk.db \
+  --checkpoint output/orchestrator.checkpoint.json
+
+# 进程重启后，只处理 checkpoint 之后追加的完整行
+conda run -n agent python -m logfusion orchestrate run \
+  --input output/normalized.jsonl \
+  --feature-state output/features.db \
+  --baseline-state output/baseline.db \
+  --detection-state output/detection.db \
+  --incident-state output/incidents.db \
+  --risk-state output/risk.db \
+  --checkpoint output/orchestrator.checkpoint.json --resume
+```
+
+默认 watermark 是已观察最大 `event.time` 减 5 分钟，可用 `--watermark-lag-seconds` 调整；它用于关闭稳定的实时会话。末尾尚未写完的一行不会提交，会留给下次追加后处理。输入必须是 append-only：恢复时如已提交前缀被改写、文件被替换、配置或任一 State DB 路径改变，编排器会拒绝继续。`--no-downstream` 仅更新 Feature DB，适合排障或分阶段运行。
+
+## Alert Lifecycle & Analyst Feedback v1
+
+Risk DB 只保存机器产生的版本化告警；Case DB 以稳定的 `alert_key` 保存人工处理状态，因此 Fusion 更新和旧告警 `superseded` 不会覆盖分析结论。先同步新的 active alert：
+
+```bash
+conda run -n agent python -m logfusion cases sync \
+  --risk-state output/risk.db \
+  --state output/cases.db
+
+conda run -n agent python -m logfusion cases list --state output/cases.db --status new
+
+conda run -n agent python -m logfusion cases transition \
+  --risk-state output/risk.db --state output/cases.db \
+  --case-id <case_id> --status investigating --actor alice \
+  --note '已开始核查会话与仓库访问'
+```
+
+支持 `new`、`acknowledged`、`investigating`、`resolved`、`false_positive`、`suppressed` 状态，以及 `assign`、`comment`、`set-tags`。`suppressed` 必须指定未来的 `--suppression-until`；到期后下一次 `cases sync` 自动恢复为 `new`。所有操作都写入 Case DB 的审计事件。终态 Case 收到新的风险告警版本时保持原结论，但标记 `requires_review: true`，由分析员决定是否重新打开。
 
 ## Parser 生命周期（unknown → active）
 
@@ -353,6 +438,7 @@ conda run -n agent python -m logfusion quality drift \
 |------|------|
 | `parse` | 流式读取本地/压缩文件 → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
 | `consume kafka` | Kafka → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
+| `consume kafka-ueba` | Kafka → 解析输出 + 增量 Feature / Baseline / Detection / Correlation / Fusion，并在本地持久化后提交 offset |
 | `features build` | 完整 normalized JSONL → SQLite 用户窗口与会话状态 |
 | `features query` | 查询用户在时间范围内相交的窗口与会话 |
 | `baseline build` | Feature DB → 独立的个人/全局 Baseline DB（支持 revision 增量更新） |
@@ -363,6 +449,10 @@ conda run -n agent python -m logfusion quality drift \
 | `correlate query` | 查询用户时间范围内相交的 active Incident |
 | `fuse run` | Detection DB + Incident DB → 风险评估与策略控制后的告警 DB |
 | `fuse query` | 查询用户时间范围内相交的 active 风险评估与告警 |
+| `orchestrate run` | 追加式 normalized JSONL → 增量 Feature / Baseline / Detection / Correlation / Fusion 链路 |
+| `cases sync` | Risk DB active alert → 稳定逻辑 Case 与审计状态 |
+| `cases list/show` | 查询 Case 列表或完整证据/操作时间线 |
+| `cases transition/assign/comment/set-tags` | 人工处置、负责人、评论和标签操作 |
 | `propose-parsers` | unknown → 启发式或 LLM draft parser 候选 |
 | `registry register-candidates` | 候选写入 registry |
 | `registry list` | 列出 registry 中的 parser |
@@ -414,6 +504,9 @@ LogFusion/
 | `detection.py` | SQLite DetectionEngine、统计异常候选与 revision 替代 |
 | `correlation.py` | SQLite CorrelationEngine、session/时间桶关联与 Incident 聚合 |
 | `fusion.py` | SQLite FusionEngine、风险评分、告警门槛、预算抑制与版本替代 |
+| `orchestrator.py` | 追加 JSONL 编排、event-time watermark、全链路推进与断点恢复 |
+| `kafka_ueba.py` | Kafka 解析、UEBA 链路与 offset/checkpoint 提交顺序适配 |
+| `cases.py` | SQLite CaseEngine、人工生命周期、审计事件与版本更新复核 |
 
 ## 配置要点
 

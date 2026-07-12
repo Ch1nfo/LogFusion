@@ -121,6 +121,75 @@ def load_kafka_config(path: Path) -> dict[str, Any]:
     return settings
 
 
+def load_fusion_policy(path: Path) -> dict[str, Any]:
+    """Load scalar settings from a local ``fusion:`` policy YAML section."""
+    settings: dict[str, Any] = {}
+    active = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "fusion:":
+            active = True
+            continue
+        if not raw_line[0].isspace() and stripped.endswith(":"):
+            active = False
+            continue
+        if active and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            settings[key.strip()] = _typed_value(value)
+    for key in ("alert_threshold", "critical_threshold", "cross_system_bonus", "detector_bonus", "detector_bonus_cap", "per_user_daily_alert_limit"):
+        if key in settings:
+            try:
+                settings[key] = int(settings[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"fusion policy {key} must be an integer") from exc
+    return settings
+
+
+def load_detection_policy(path: Path) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    active = False
+    source_type: str | None = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "detection:":
+            active = True
+            continue
+        if not raw_line[0].isspace() and stripped.endswith(":"):
+            active = False
+            continue
+        if active and stripped == "source_type:":
+            settings["source_type_overrides"] = {}
+            source_type = None
+            continue
+        if active and raw_line.startswith("    ") and stripped.endswith(":"):
+            source_type = stripped[:-1]
+            settings.setdefault("source_type_overrides", {})[source_type] = {}
+            continue
+        if active and source_type is not None and raw_line.startswith("      ") and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            settings["source_type_overrides"][source_type][key.strip()] = _typed_value(value)
+            continue
+        if active and ":" in stripped and not stripped.endswith(":"):
+            key, value = stripped.split(":", 1)
+            settings[key.strip()] = _typed_value(value)
+    for key in ("rare_event_count_max", "p95_score", "p99_score", "new_value_score", "rare_value_score"):
+        if key in settings:
+            settings[key] = int(settings[key])
+    if "rare_share_threshold" in settings:
+        settings["rare_share_threshold"] = float(settings["rare_share_threshold"])
+    for override in settings.get("source_type_overrides", {}).values():
+        for key in ("rare_event_count_max", "p95_score", "p99_score", "new_value_score", "rare_value_score"):
+            if key in override:
+                override[key] = int(override[key])
+        if "rare_share_threshold" in override:
+            override["rare_share_threshold"] = float(override["rare_share_threshold"])
+    return settings
+
+
 def _value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:

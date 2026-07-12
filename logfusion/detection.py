@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -31,6 +31,11 @@ class DetectionConfig:
     window_sizes_seconds: tuple[int, ...] = WINDOW_SIZES
     rare_share_threshold: float = 0.01
     rare_event_count_max: int = 3
+    p95_score: int = 60
+    p99_score: int = 80
+    new_value_score: int = 75
+    rare_value_score: int = 55
+    source_type_overrides: dict[str, dict[str, int | float]] = field(default_factory=dict)
 
     def fingerprint(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -54,7 +59,7 @@ class DetectionEngine:
         self.detection_path = Path(detection_state)
         self.detection_path.parent.mkdir(parents=True, exist_ok=True)
         self.config = config or DetectionConfig()
-        if not 0 < self.config.rare_share_threshold <= 1 or self.config.rare_event_count_max <= 0:
+        if not 0 < self.config.rare_share_threshold <= 1 or self.config.rare_event_count_max <= 0 or any(not 0 <= value <= 100 for value in (self.config.p95_score, self.config.p99_score, self.config.new_value_score, self.config.rare_value_score)):
             raise DetectionError("invalid detection configuration")
         self.feature = _readonly(self.feature_path)
         self.baseline = _readonly(self.baseline_path)
@@ -138,6 +143,7 @@ class DetectionEngine:
         skipped: list[str] = []
         user_name = window["user_name"]
         window_size = int(window["window_size"])
+        policy, policy_id = self._window_policy(window)
         user_ready = self._baseline_status("user_metric_baselines", user_name, window_size)
         global_ready = self._baseline_status("global_metric_baselines", None, window_size)
         if user_ready:
@@ -154,14 +160,16 @@ class DetectionEngine:
                     continue
                 value = float(window[metric])
                 if value > float(reference["p99"]):
-                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p99", 80, baseline_revision))
+                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p99", int(policy["p99_score"]), baseline_revision))
                 elif value > float(reference["p95"]):
-                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p95", 60, baseline_revision))
-        candidates.extend(self._value_candidates(window, user_ready, global_ready, baseline_revision))
+                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p95", int(policy["p95_score"]), baseline_revision))
+        candidates.extend(self._value_candidates(window, user_ready, global_ready, baseline_revision, policy))
+        for candidate in candidates:
+            candidate["explanation"]["policy"] = {"id": policy_id, **policy}
         return candidates, skipped
 
     def _value_candidates(
-        self, window: sqlite3.Row, user_ready: bool, global_ready: bool, baseline_revision: int,
+        self, window: sqlite3.Row, user_ready: bool, global_ready: bool, baseline_revision: int, policy: dict[str, int | float],
     ) -> list[dict[str, Any]]:
         if not user_ready and not global_ready:
             return []
@@ -182,10 +190,20 @@ class DetectionEngine:
                 continue
             first_seen = int(reference["first_seen"])
             if first_seen == int(window["window_start"]):
-                candidates.append(self._value_candidate(window, value, reference, scope, "new_value_30d", 75, baseline_revision))
-            if float(reference["share"]) <= self.config.rare_share_threshold and int(reference["event_count"]) <= self.config.rare_event_count_max:
-                candidates.append(self._value_candidate(window, value, reference, scope, "rare_value", 55, baseline_revision))
+                candidates.append(self._value_candidate(window, value, reference, scope, "new_value_30d", int(policy["new_value_score"]), baseline_revision))
+            if float(reference["share"]) <= float(policy["rare_share_threshold"]) and int(reference["event_count"]) <= int(policy["rare_event_count_max"]):
+                candidates.append(self._value_candidate(window, value, reference, scope, "rare_value", int(policy["rare_value_score"]), baseline_revision))
         return candidates
+
+    def _window_policy(self, window: sqlite3.Row) -> tuple[dict[str, int | float], str]:
+        policy: dict[str, int | float] = {key: getattr(self.config, key) for key in ("rare_share_threshold", "rare_event_count_max", "p95_score", "p99_score", "new_value_score", "rare_value_score")}
+        rows = self.feature.execute("SELECT value_key FROM window_value_counts WHERE user_name = ? AND window_size = ? AND window_start = ? AND value_type = 'source_type' ORDER BY value_key", (window["user_name"], window["window_size"], window["window_start"])).fetchall()
+        for row in rows:
+            override = self.config.source_type_overrides.get(row["value_key"])
+            if override:
+                policy.update(override)
+                return policy, f"source_type:{row['value_key']}"
+        return policy, "default"
 
     def _numeric_candidate(
         self, window: sqlite3.Row, metric: str, value: float, reference: sqlite3.Row, scope: str,
