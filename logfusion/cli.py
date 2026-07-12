@@ -6,6 +6,11 @@ import os
 from pathlib import Path
 
 from logfusion.config import load_kafka_config, load_llm_config, load_sources_config
+from logfusion.baseline import BaselineEngine, BaselineError, query_baseline_state
+from logfusion.correlation import CorrelationEngine, CorrelationError, query_incident_state
+from logfusion.detection import DetectionEngine, DetectionError, query_detection_state
+from logfusion.features import FeatureError, build_features_from_jsonl, query_feature_state
+from logfusion.fusion import FusionEngine, FusionError, query_risk_state
 from logfusion.kafka_source import KafkaConsumerError, run_kafka_streaming_pipeline
 from logfusion.parser_candidates import propose_parser_candidates
 from logfusion.llm_generation import generate_and_validate_llm_candidates, generate_llm_candidates
@@ -46,6 +51,66 @@ def main(argv: list[str] | None = None) -> int:
     kafka_consume_parser.add_argument("--checkpoint-every", type=int, default=10_000)
     kafka_consume_parser.add_argument("--resume", action="store_true")
     kafka_consume_parser.add_argument("--once", action="store_true")
+
+    features_parser = subparsers.add_parser("features")
+    features_subparsers = features_parser.add_subparsers(dest="features_command", required=True)
+    features_build_parser = features_subparsers.add_parser("build")
+    features_build_parser.add_argument("--input", required=True)
+    features_build_parser.add_argument("--state", required=True)
+    features_build_parser.add_argument("--batch-size", type=int, default=1000)
+    features_query_parser = features_subparsers.add_parser("query")
+    features_query_parser.add_argument("--state", required=True)
+    features_query_parser.add_argument("--user", required=True)
+    features_query_parser.add_argument("--from", dest="from_time", required=True)
+    features_query_parser.add_argument("--to", dest="to_time", required=True)
+    features_query_parser.add_argument("--window-size", type=int)
+
+    baseline_parser = subparsers.add_parser("baseline")
+    baseline_subparsers = baseline_parser.add_subparsers(dest="baseline_command", required=True)
+    baseline_build_parser = baseline_subparsers.add_parser("build")
+    baseline_build_parser.add_argument("--feature-state", required=True)
+    baseline_build_parser.add_argument("--state", required=True)
+    baseline_build_parser.add_argument("--as-of")
+    baseline_query_parser = baseline_subparsers.add_parser("query")
+    baseline_query_parser.add_argument("--state", required=True)
+    baseline_query_parser.add_argument("--user", required=True)
+    baseline_query_parser.add_argument("--window-size", type=int)
+
+    detect_parser = subparsers.add_parser("detect")
+    detect_subparsers = detect_parser.add_subparsers(dest="detect_command", required=True)
+    detect_run_parser = detect_subparsers.add_parser("run")
+    detect_run_parser.add_argument("--feature-state", required=True)
+    detect_run_parser.add_argument("--baseline-state", required=True)
+    detect_run_parser.add_argument("--state", required=True)
+    detect_query_parser = detect_subparsers.add_parser("query")
+    detect_query_parser.add_argument("--state", required=True)
+    detect_query_parser.add_argument("--user", required=True)
+    detect_query_parser.add_argument("--from", dest="from_time", required=True)
+    detect_query_parser.add_argument("--to", dest="to_time", required=True)
+
+    correlate_parser = subparsers.add_parser("correlate")
+    correlate_subparsers = correlate_parser.add_subparsers(dest="correlate_command", required=True)
+    correlate_run_parser = correlate_subparsers.add_parser("run")
+    correlate_run_parser.add_argument("--feature-state", required=True)
+    correlate_run_parser.add_argument("--detection-state", required=True)
+    correlate_run_parser.add_argument("--state", required=True)
+    correlate_query_parser = correlate_subparsers.add_parser("query")
+    correlate_query_parser.add_argument("--state", required=True)
+    correlate_query_parser.add_argument("--user", required=True)
+    correlate_query_parser.add_argument("--from", dest="from_time", required=True)
+    correlate_query_parser.add_argument("--to", dest="to_time", required=True)
+
+    fuse_parser = subparsers.add_parser("fuse")
+    fuse_subparsers = fuse_parser.add_subparsers(dest="fuse_command", required=True)
+    fuse_run_parser = fuse_subparsers.add_parser("run")
+    fuse_run_parser.add_argument("--detection-state", required=True)
+    fuse_run_parser.add_argument("--incident-state", required=True)
+    fuse_run_parser.add_argument("--state", required=True)
+    fuse_query_parser = fuse_subparsers.add_parser("query")
+    fuse_query_parser.add_argument("--state", required=True)
+    fuse_query_parser.add_argument("--user", required=True)
+    fuse_query_parser.add_argument("--from", dest="from_time", required=True)
+    fuse_query_parser.add_argument("--to", dest="to_time", required=True)
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -140,6 +205,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "consume":
         return _handle_consume(args)
+    if args.command == "features":
+        return _handle_features(args)
+    if args.command == "baseline":
+        return _handle_baseline(args)
+    if args.command == "detect":
+        return _handle_detect(args)
+    if args.command == "correlate":
+        return _handle_correlate(args)
+    if args.command == "fuse":
+        return _handle_fuse(args)
     if args.command == "propose-parsers":
         unknown = _read_jsonl(Path(args.unknown_input))
         llm_settings = load_llm_config(Path(args.llm_config)) if args.llm_config else {}
@@ -293,6 +368,90 @@ def _handle_consume(args: argparse.Namespace) -> int:
     except (CheckpointError, KafkaConsumerError, ValueError) as exc:
         print(str(exc))
         return 1
+    return 0
+
+
+def _handle_features(args: argparse.Namespace) -> int:
+    try:
+        if args.features_command == "build":
+            if args.batch_size <= 0:
+                print("--batch-size must be greater than zero")
+                return 2
+            report = build_features_from_jsonl(Path(args.input), Path(args.state), args.batch_size)
+        elif args.features_command == "query":
+            report = query_feature_state(
+                Path(args.state), args.user, args.from_time, args.to_time, args.window_size,
+            )
+        else:
+            return 2
+    except FeatureError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_baseline(args: argparse.Namespace) -> int:
+    try:
+        if args.baseline_command == "build":
+            with BaselineEngine(Path(args.feature_state), Path(args.state)) as engine:
+                report = engine.update(args.as_of)
+        elif args.baseline_command == "query":
+            report = query_baseline_state(Path(args.state), args.user, args.window_size)
+        else:
+            return 2
+    except BaselineError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_detect(args: argparse.Namespace) -> int:
+    try:
+        if args.detect_command == "run":
+            with DetectionEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.state)) as engine:
+                report = engine.run()
+        elif args.detect_command == "query":
+            report = query_detection_state(Path(args.state), args.user, args.from_time, args.to_time)
+        else:
+            return 2
+    except DetectionError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_correlate(args: argparse.Namespace) -> int:
+    try:
+        if args.correlate_command == "run":
+            with CorrelationEngine(Path(args.feature_state), Path(args.detection_state), Path(args.state)) as engine:
+                report = engine.run()
+        elif args.correlate_command == "query":
+            report = query_incident_state(Path(args.state), args.user, args.from_time, args.to_time)
+        else:
+            return 2
+    except CorrelationError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _handle_fuse(args: argparse.Namespace) -> int:
+    try:
+        if args.fuse_command == "run":
+            with FusionEngine(Path(args.detection_state), Path(args.incident_state), Path(args.state)) as engine:
+                report = engine.run()
+        elif args.fuse_command == "query":
+            report = query_risk_state(Path(args.state), args.user, args.from_time, args.to_time)
+        else:
+            return 2
+    except FusionError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0
 
 

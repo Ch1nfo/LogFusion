@@ -2,7 +2,7 @@
 
 本地日志解析 MVP：把本地文件日志归一成 **Canonical Event v0**，无法识别的记录进入 unknown 池，并提供 parser 候选 → 注册 → 测试 → shadow → active 的完整生命周期，以及 raw 回放与版本对比。
 
-当前阶段支持本地历史文件与 Kafka 实时消费。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
+当前阶段支持本地历史文件与 Kafka 实时消费，以及基于 `user.name` 的 Session + Feature v1 行为聚合。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
 
 ## 环境
 
@@ -94,6 +94,107 @@ conda run -n agent python -m logfusion consume kafka \
 ```
 
 加 `--once` 可在一次空 poll 后退出，适合批量排空与调试；默认持续消费。Kafka 原始引用格式为 `kafka://<topic>/<partition>/<offset>`，并保留 topic、partition、offset 与 broker 时间戳。
+
+## Session + Feature v1
+
+规范化事件可进一步按完全相同的 `user.name` 聚合为固定时间窗口和跨系统行为会话，为下一阶段行为基线提供确定性状态。状态保存到本地 SQLite；它不做账号别名合并或异常判定。
+
+先用一份完整的 normalized JSONL 历史初始化新的状态库：
+
+```bash
+conda run -n agent python -m logfusion features build \
+  --input output/normalized.jsonl \
+  --state output/features.db
+```
+
+`build` 流式读取 JSONL，生成 1 分钟、5 分钟、1 小时与 1 天窗口，并以 30 分钟不活跃间隔构建用户会话。重复 `event.id` 不会重复累计；历史初始化在 EOF 后关闭会话，已完成的状态库不能再追加历史文件，补录历史必须用完整输入重建新库。
+
+查询用户窗口与会话：
+
+```bash
+conda run -n agent python -m logfusion features query \
+  --state output/features.db \
+  --user wangkun78 \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z \
+  --window-size 3600
+```
+
+返回范围内相交的窗口和会话。窗口包含事件/结果计数、来源/IP/资源/动作 distinct、读写动作、网络字节数及首次 IP/资源/动作计数；会话保留有界的调查样本和动作首尾序列。精确频次、首次/最后时间和 revision 保存在 SQLite，供后续 Baseline Engine 增量读取。
+
+## Baseline Engine v1
+
+基线引擎从 Feature DB 生成独立的 Baseline DB，不改写特征状态。它按完全相同的 `user.name` 建立个人基线，并从已观察到的用户窗口建立全局参照；默认使用全局最新事件时间截止的滚动 30 天历史。
+
+```bash
+conda run -n agent python -m logfusion baseline build \
+  --feature-state output/features.db \
+  --state output/baseline.db
+
+conda run -n agent python -m logfusion baseline query \
+  --state output/baseline.db \
+  --user wangkun78 \
+  --window-size 3600
+```
+
+首版构建 1 小时和 1 天的事件量、结果、distinct、读写、字节与首次出现统计，保存均值、标准差、P50/P95/P99、MAD 和常用 IP/资源/动作频次。个人基线只在用户首末行为之间补齐零窗口；全局基线只使用真实存在的窗口。基线至少有 14 个活跃日和 20 个窗口样本时标为 `ready`，否则标为 `warming_up`。再次运行 `baseline build` 会按 Feature revision 增量更新；Feature 或 Baseline 配置变化时需重建 Baseline DB。
+
+## Statistical Anomaly Detection v1
+
+检测引擎消费已同步的 Feature DB 与 Baseline DB，输出独立 SQLite 中可解释的异常候选；不会触发告警或自动处置。先确保 `baseline build` 已运行到当前 Feature revision：
+
+```bash
+conda run -n agent python -m logfusion detect run \
+  --feature-state output/features.db \
+  --baseline-state output/baseline.db \
+  --state output/detection.db
+
+conda run -n agent python -m logfusion detect query \
+  --state output/detection.db \
+  --user wangkun78 \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z
+```
+
+首版检测 1 小时和 1 天窗口的个人 P95/P99 偏离；个人基线未就绪时可回退到 ready 的全局基线。它还检测 30 天首次值和占比不超过 1%、累计不超过 3 次的低频 IP、资源、动作与来源类型。候选分数固定为 P95=60、P99=80、首次值=75、低频值=55；80+ 为 `high`、60–79 为 `medium`、其余为 `low`。同一窗口重跑不会重复写入；迟到事件修订窗口时新候选会替代旧候选。
+
+## Cross-System Correlation & Incident Aggregation v1
+
+关联引擎把同一用户的多个 active anomaly candidates 聚合为版本化 Incident。运行前 Detection DB 必须已经消费到当前 Feature revision：
+
+```bash
+conda run -n agent python -m logfusion correlate run \
+  --feature-state output/features.db \
+  --detection-state output/detection.db \
+  --state output/incidents.db
+
+conda run -n agent python -m logfusion correlate query \
+  --state output/incidents.db \
+  --user wangkun78 \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z
+```
+
+1 小时候选优先关联到相交的 Feature session；没有 session 时按用户和 1 小时时间桶关联。日窗口候选按日窗口独立聚合。Incident 保存候选时间线、来源系统、IP、资源、证据 ID 和 supersedes 链。聚合分采用“最高候选分 + 每个附加候选 5 分、最多奖励 20 分”，只用于排序，不代表最终告警风险。
+
+## Risk Fusion & Detection Policy v1
+
+风险融合引擎消费已同步的 Detection DB 与 Incident DB，把 active Incident 转为独立、版本化的风险评估和策略控制后的告警。先确保 `correlate run` 已消费到当前 Detection revision：
+
+```bash
+conda run -n agent python -m logfusion fuse run \
+  --detection-state output/detection.db \
+  --incident-state output/incidents.db \
+  --state output/risk.db
+
+conda run -n agent python -m logfusion fuse query \
+  --state output/risk.db \
+  --user wangkun78 \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z
+```
+
+首版风险分为 Incident 聚合分，加上跨来源系统奖励 10 分，以及每多一种检测器 3 分（总计最多 10 分），最高 100 分。`80+` 进入告警策略、`90+` 为 `critical`；每个用户每天默认最多产生 3 条告警，超过预算的高风险评估保留为 `suppressed_budget`，低于门槛的保留为 `below_threshold`。输入 revision 更新时，旧风险评估和告警标记为 `superseded`，新版本保留明确的替代链。该模块尚不引入资产、部门、身份图谱或外部 SOC 推送。
 
 ## Parser 生命周期（unknown → active）
 
@@ -252,6 +353,16 @@ conda run -n agent python -m logfusion quality drift \
 |------|------|
 | `parse` | 流式读取本地/压缩文件 → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
 | `consume kafka` | Kafka → normalized / unknown / summary（可选 raw store、registry、checkpoint） |
+| `features build` | 完整 normalized JSONL → SQLite 用户窗口与会话状态 |
+| `features query` | 查询用户在时间范围内相交的窗口与会话 |
+| `baseline build` | Feature DB → 独立的个人/全局 Baseline DB（支持 revision 增量更新） |
+| `baseline query` | 查询用户基线画像及对应全局参照 |
+| `detect run` | Feature DB + Baseline DB → 可解释的统计异常候选 DB |
+| `detect query` | 查询用户时间范围内相交的 active 异常候选 |
+| `correlate run` | Active anomaly candidates → 版本化跨系统 Incident DB |
+| `correlate query` | 查询用户时间范围内相交的 active Incident |
+| `fuse run` | Detection DB + Incident DB → 风险评估与策略控制后的告警 DB |
+| `fuse query` | 查询用户时间范围内相交的 active 风险评估与告警 |
 | `propose-parsers` | unknown → 启发式或 LLM draft parser 候选 |
 | `registry register-candidates` | 候选写入 registry |
 | `registry list` | 列出 registry 中的 parser |
@@ -298,6 +409,11 @@ LogFusion/
 | `shadow_replay.py` | shadow 重放 |
 | `active_runtime.py` | active parser 兜底与冲突择优 |
 | `replay_compare.py` | 双 registry replay 对比 |
+| `features.py` | SQLite FeatureEngine、窗口聚合、会话构建与 JSONL build/query |
+| `baseline.py` | SQLite BaselineEngine、个人/全局统计与值频次基线 |
+| `detection.py` | SQLite DetectionEngine、统计异常候选与 revision 替代 |
+| `correlation.py` | SQLite CorrelationEngine、session/时间桶关联与 Incident 聚合 |
+| `fusion.py` | SQLite FusionEngine、风险评分、告警门槛、预算抑制与版本替代 |
 
 ## 配置要点
 
@@ -326,11 +442,11 @@ sources:
 - [设计说明](docs/local-file-parser-mvp-design.md) — 流水线、schema、registry、replay 细节
 - [实现计划](docs/local-file-parser-mvp-plan.md) — MVP 任务清单与约束
 
-## 明确不做（本阶段）
+## 明确不做（当前阶段）
 
-- Kafka / 远程采集
 - ECS / OCSF 导出适配器
-- 数据库持久化（产物均为本地 JSON / JSONL）
+- 账号/资产实体图谱与组织上下文增强
+- 风险融合、场景化权重与告警抑制
 
 ## License
 
