@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-DETECTION_SCHEMA_VERSION = "1"
+DETECTION_SCHEMA_VERSION = "2"
 FEATURE_SCHEMA_VERSION = "1"
-BASELINE_SCHEMA_VERSION = "1"
+BASELINE_SCHEMA_VERSION = "2"
 WINDOW_SIZES = (3600, 86400)
 METRICS = (
     "event_count", "success_count", "failure_count", "other_outcome_count",
@@ -145,9 +145,13 @@ class DetectionEngine:
         window_size = int(window["window_size"])
         policy, policy_id = self._window_policy(window)
         user_ready = self._baseline_status("user_metric_baselines", user_name, window_size)
+        group_id = self._group_id(user_name)
+        peer_ready = bool(group_id) and self._baseline_status("peer_group_metric_baselines", group_id, window_size)
         global_ready = self._baseline_status("global_metric_baselines", None, window_size)
         if user_ready:
             scope = "personal"
+        elif peer_ready:
+            scope = "peer_group"
         elif global_ready:
             scope = "global"
         else:
@@ -155,25 +159,25 @@ class DetectionEngine:
             skipped.append("baseline_not_ready")
         if scope is not None:
             for metric in METRICS:
-                reference = self._metric_reference(scope, user_name, window_size, metric)
+                reference = self._metric_reference(scope, user_name, window_size, metric, group_id)
                 if reference is None or reference["p95"] is None or reference["p99"] is None:
                     continue
                 value = float(window[metric])
                 if value > float(reference["p99"]):
-                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p99", int(policy["p99_score"]), baseline_revision))
+                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p99", int(policy["p99_score"]), baseline_revision, group_id))
                 elif value > float(reference["p95"]):
-                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p95", int(policy["p95_score"]), baseline_revision))
-        candidates.extend(self._value_candidates(window, user_ready, global_ready, baseline_revision, policy))
+                    candidates.append(self._numeric_candidate(window, metric, value, reference, scope, "numeric_p95", int(policy["p95_score"]), baseline_revision, group_id))
+        candidates.extend(self._value_candidates(window, user_ready, peer_ready, global_ready, baseline_revision, policy, group_id))
         for candidate in candidates:
             candidate["explanation"]["policy"] = {"id": policy_id, **policy}
         return candidates, skipped
 
     def _value_candidates(
-        self, window: sqlite3.Row, user_ready: bool, global_ready: bool, baseline_revision: int, policy: dict[str, int | float],
+        self, window: sqlite3.Row, user_ready: bool, peer_ready: bool, global_ready: bool, baseline_revision: int, policy: dict[str, int | float], group_id: str | None,
     ) -> list[dict[str, Any]]:
-        if not user_ready and not global_ready:
+        if not user_ready and not peer_ready and not global_ready:
             return []
-        scope = "personal" if user_ready else "global"
+        scope = "personal" if user_ready else ("peer_group" if peer_ready else "global")
         values = self.feature.execute(
             """
             SELECT value_type, value_key, display_value, event_count
@@ -185,14 +189,14 @@ class DetectionEngine:
         ).fetchall()
         candidates: list[dict[str, Any]] = []
         for value in values:
-            reference = self._value_reference(scope, window["user_name"], value["value_type"], value["value_key"])
+            reference = self._value_reference(scope, window["user_name"], value["value_type"], value["value_key"], group_id)
             if reference is None:
                 continue
             first_seen = int(reference["first_seen"])
             if first_seen == int(window["window_start"]):
-                candidates.append(self._value_candidate(window, value, reference, scope, "new_value_30d", int(policy["new_value_score"]), baseline_revision))
+                candidates.append(self._value_candidate(window, value, reference, scope, "new_value_30d", int(policy["new_value_score"]), baseline_revision, group_id))
             if float(reference["share"]) <= float(policy["rare_share_threshold"]) and int(reference["event_count"]) <= int(policy["rare_event_count_max"]):
-                candidates.append(self._value_candidate(window, value, reference, scope, "rare_value", int(policy["rare_value_score"]), baseline_revision))
+                candidates.append(self._value_candidate(window, value, reference, scope, "rare_value", int(policy["rare_value_score"]), baseline_revision, group_id))
         return candidates
 
     def _window_policy(self, window: sqlite3.Row) -> tuple[dict[str, int | float], str]:
@@ -207,7 +211,7 @@ class DetectionEngine:
 
     def _numeric_candidate(
         self, window: sqlite3.Row, metric: str, value: float, reference: sqlite3.Row, scope: str,
-        detector_id: str, score: int, baseline_revision: int,
+        detector_id: str, score: int, baseline_revision: int, group_id: str | None = None,
     ) -> dict[str, Any]:
         explanation = {
             "kind": "numeric_deviation",
@@ -219,11 +223,11 @@ class DetectionEngine:
             },
             "trigger": detector_id,
         }
-        return self._candidate_base(window, detector_id, metric, None, None, score, scope, explanation, baseline_revision)
+        return self._candidate_base(window, detector_id, metric, None, None, score, scope, explanation, baseline_revision, group_id)
 
     def _value_candidate(
         self, window: sqlite3.Row, value: sqlite3.Row, reference: sqlite3.Row, scope: str,
-        detector_id: str, score: int, baseline_revision: int,
+        detector_id: str, score: int, baseline_revision: int, group_id: str | None = None,
     ) -> dict[str, Any]:
         explanation = {
             "kind": "value_rarity",
@@ -237,12 +241,12 @@ class DetectionEngine:
             "trigger": detector_id,
         }
         return self._candidate_base(
-            window, detector_id, None, value["value_type"], value["value_key"], score, scope, explanation, baseline_revision,
+            window, detector_id, None, value["value_type"], value["value_key"], score, scope, explanation, baseline_revision, group_id,
         )
 
     def _candidate_base(
         self, window: sqlite3.Row, detector_id: str, metric: str | None, value_type: str | None,
-        value_key: str | None, score: int, scope: str, explanation: dict[str, Any], baseline_revision: int,
+        value_key: str | None, score: int, scope: str, explanation: dict[str, Any], baseline_revision: int, group_id: str | None = None,
     ) -> dict[str, Any]:
         identity = ":".join(str(value) for value in (
             window["user_name"], window["window_size"], window["window_start"], detector_id, metric or "", value_type or "", value_key or "",
@@ -255,6 +259,7 @@ class DetectionEngine:
             "window_size": int(window["window_size"]), "window_start": int(window["window_start"]), "window_end": int(window["window_end"]),
             "detector_id": detector_id, "metric": metric, "value_type": value_type, "value_key": value_key,
             "score": score, "severity": _severity(score), "baseline_scope": scope,
+            "baseline_group_id": group_id if scope == "peer_group" else None,
             "feature_revision": revision, "baseline_revision": baseline_revision, "explanation": explanation,
         }
 
@@ -268,14 +273,14 @@ class DetectionEngine:
                 """
                 INSERT INTO anomaly_candidates(
                     candidate_id, candidate_key, user_name, window_size, window_start, window_end,
-                    detector_id, metric, value_type, value_key, score, severity, baseline_scope,
+                    detector_id, metric, value_type, value_key, baseline_group_id, score, severity, baseline_scope,
                     feature_revision, baseline_revision, explanation_json, status, supersedes_candidate_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
                     candidate["candidate_id"], candidate["candidate_key"], candidate["user_name"], candidate["window_size"],
                     candidate["window_start"], candidate["window_end"], candidate["detector_id"], candidate["metric"],
-                    candidate["value_type"], candidate["value_key"], candidate["score"], candidate["severity"],
+                    candidate["value_type"], candidate["value_key"], candidate["baseline_group_id"], candidate["score"], candidate["severity"],
                     candidate["baseline_scope"], candidate["feature_revision"], candidate["baseline_revision"],
                     json.dumps(candidate["explanation"], ensure_ascii=False, sort_keys=True), previous["candidate_id"] if previous else None,
                     _now_ms(), _now_ms(),
@@ -302,6 +307,8 @@ class DetectionEngine:
                 "SELECT status FROM user_metric_baselines WHERE user_name = ? AND window_size = ? AND metric = 'event_count'",
                 (user_name, window_size),
             ).fetchone()
+        elif table == "peer_group_metric_baselines":
+            row = self.baseline.execute("SELECT status FROM peer_group_metric_baselines WHERE group_id = ? AND window_size = ? AND metric = 'event_count'", (user_name, window_size)).fetchone()
         else:
             row = self.baseline.execute(
                 "SELECT status FROM global_metric_baselines WHERE window_size = ? AND metric = 'event_count'",
@@ -309,25 +316,33 @@ class DetectionEngine:
             ).fetchone()
         return row is not None and row["status"] == "ready"
 
-    def _metric_reference(self, scope: str, user_name: str, window_size: int, metric: str) -> sqlite3.Row | None:
+    def _metric_reference(self, scope: str, user_name: str, window_size: int, metric: str, group_id: str | None = None) -> sqlite3.Row | None:
         if scope == "personal":
             return self.baseline.execute(
                 "SELECT * FROM user_metric_baselines WHERE user_name = ? AND window_size = ? AND metric = ?",
                 (user_name, window_size, metric),
             ).fetchone()
+        if scope == "peer_group":
+            return self.baseline.execute("SELECT * FROM peer_group_metric_baselines WHERE group_id = ? AND window_size = ? AND metric = ?", (group_id, window_size, metric)).fetchone()
         return self.baseline.execute(
             "SELECT * FROM global_metric_baselines WHERE window_size = ? AND metric = ?", (window_size, metric)
         ).fetchone()
 
-    def _value_reference(self, scope: str, user_name: str, value_type: str, value_key: str) -> sqlite3.Row | None:
+    def _value_reference(self, scope: str, user_name: str, value_type: str, value_key: str, group_id: str | None = None) -> sqlite3.Row | None:
         if scope == "personal":
             return self.baseline.execute(
                 "SELECT * FROM user_value_baselines WHERE user_name = ? AND value_type = ? AND value_key = ?",
                 (user_name, value_type, value_key),
             ).fetchone()
+        if scope == "peer_group":
+            return self.baseline.execute("SELECT * FROM peer_group_value_baselines WHERE group_id = ? AND value_type = ? AND value_key = ?", (group_id, value_type, value_key)).fetchone()
         return self.baseline.execute(
             "SELECT * FROM global_value_baselines WHERE value_type = ? AND value_key = ?", (value_type, value_key)
         ).fetchone()
+
+    def _group_id(self, user_name: str) -> str | None:
+        row = self.baseline.execute("SELECT group_id FROM peer_group_memberships WHERE user_name = ?", (user_name,)).fetchone()
+        return row["group_id"] if row else None
 
     def _verify_inputs(self) -> None:
         feature_meta = _meta_map(self.feature, "feature_meta")
@@ -354,7 +369,7 @@ class DetectionEngine:
             CREATE TABLE IF NOT EXISTS anomaly_candidates (
                 candidate_id TEXT PRIMARY KEY, candidate_key TEXT NOT NULL, user_name TEXT NOT NULL,
                 window_size INTEGER NOT NULL, window_start INTEGER NOT NULL, window_end INTEGER NOT NULL,
-                detector_id TEXT NOT NULL, metric TEXT, value_type TEXT, value_key TEXT,
+                detector_id TEXT NOT NULL, metric TEXT, value_type TEXT, value_key TEXT, baseline_group_id TEXT,
                 score INTEGER NOT NULL, severity TEXT NOT NULL, baseline_scope TEXT NOT NULL,
                 feature_revision INTEGER NOT NULL, baseline_revision INTEGER NOT NULL,
                 explanation_json TEXT NOT NULL, status TEXT NOT NULL, supersedes_candidate_id TEXT,

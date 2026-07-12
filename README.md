@@ -159,6 +159,21 @@ conda run -n agent python -m logfusion baseline query \
 
 首版构建 1 小时和 1 天的事件量、结果、distinct、读写、字节与首次出现统计，保存均值、标准差、P50/P95/P99、MAD 和常用 IP/资源/动作频次。个人基线只在用户首末行为之间补齐零窗口；全局基线只使用真实存在的窗口。基线至少有 14 个活跃日和 20 个窗口样本时标为 `ready`，否则标为 `warming_up`。再次运行 `baseline build` 会按 Feature revision 增量更新；Feature 或 Baseline 配置变化时需重建 Baseline DB。
 
+可选的 Peer Group v1 在个人基线未就绪时提供比全局基线更精确的参照。映射 CSV 固定为 `user_name,group_id`，一个用户只属于一个群体：
+
+```csv
+user_name,group_id
+wangkun78,engineering
+zhangsan12,operations
+```
+
+```bash
+logfusion baseline build --feature-state output/features.db --state output/baseline.db \
+  --peer-groups config/peer-groups.csv
+```
+
+检测回退顺序为个人、同群体、全局。同群体至少需要 5 名活跃成员、14 个活跃日和 100 个真实窗口才会标记为 `ready`；群体映射改变时必须重建 Baseline DB。持续运行时可将相同参数传给 `orchestrate run` 或 `consume kafka-ueba`。
+
 ## Statistical Anomaly Detection v1
 
 检测引擎消费已同步的 Feature DB 与 Baseline DB，输出独立 SQLite 中可解释的异常候选；不会触发告警或自动处置。先确保 `baseline build` 已运行到当前 Feature revision：

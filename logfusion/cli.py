@@ -72,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     kafka_ueba_parser.add_argument("--incident-state", required=True)
     kafka_ueba_parser.add_argument("--risk-state", required=True)
     kafka_ueba_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
+    kafka_ueba_parser.add_argument("--peer-groups")
 
     features_parser = subparsers.add_parser("features")
     features_subparsers = features_parser.add_subparsers(dest="features_command", required=True)
@@ -92,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     baseline_build_parser.add_argument("--feature-state", required=True)
     baseline_build_parser.add_argument("--state", required=True)
     baseline_build_parser.add_argument("--as-of")
+    baseline_build_parser.add_argument("--peer-groups")
     baseline_query_parser = baseline_subparsers.add_parser("query")
     baseline_query_parser.add_argument("--state", required=True)
     baseline_query_parser.add_argument("--user", required=True)
@@ -151,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     orchestrate_run_parser.add_argument("--batch-size", type=int, default=1_000)
     orchestrate_run_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
     orchestrate_run_parser.add_argument("--no-downstream", action="store_true")
+    orchestrate_run_parser.add_argument("--peer-groups")
 
     cases_parser = subparsers.add_parser("cases")
     cases_subparsers = cases_parser.add_subparsers(dest="cases_command", required=True)
@@ -456,7 +459,7 @@ def _handle_consume(args: argparse.Namespace) -> int:
                 feature_state=Path(args.feature_state), baseline_state=Path(args.baseline_state),
                 detection_state=Path(args.detection_state), incident_state=Path(args.incident_state),
                 risk_state=Path(args.risk_state),
-                orchestrator_config=OrchestratorConfig(watermark_lag_seconds=args.watermark_lag_seconds),
+                orchestrator_config=OrchestratorConfig(watermark_lag_seconds=args.watermark_lag_seconds, peer_groups_path=args.peer_groups),
                 **common,
             )
     except (CheckpointError, KafkaConsumerError, ValueError) as exc:
@@ -488,7 +491,7 @@ def _handle_features(args: argparse.Namespace) -> int:
 def _handle_baseline(args: argparse.Namespace) -> int:
     try:
         if args.baseline_command == "build":
-            with BaselineEngine(Path(args.feature_state), Path(args.state)) as engine:
+            with BaselineEngine(Path(args.feature_state), Path(args.state), peer_groups_path=Path(args.peer_groups) if args.peer_groups else None) as engine:
                 report = engine.update(args.as_of)
         elif args.baseline_command == "query":
             report = query_baseline_state(Path(args.state), args.user, args.window_size)
@@ -563,7 +566,7 @@ def _handle_orchestrate(args: argparse.Namespace) -> int:
             args.incident_state, args.risk_state,
             checkpoint_path=args.checkpoint,
             resume=args.resume,
-            config=OrchestratorConfig(args.batch_size, args.watermark_lag_seconds),
+            config=OrchestratorConfig(args.batch_size, args.watermark_lag_seconds, args.peer_groups),
             run_downstream=not args.no_downstream,
         )
     except (OrchestratorError, FeatureError) as exc:

@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 CORRELATION_SCHEMA_VERSION = "1"
 FEATURE_SCHEMA_VERSION = "1"
-DETECTION_SCHEMA_VERSION = "1"
+DETECTION_SCHEMA_VERSION = "2"
 
 
 class CorrelationError(ValueError):

@@ -80,7 +80,7 @@ def run_kafka_ueba_pipeline(
         "registry_fingerprint": _file_fingerprint(registry_path),
         "output_paths": _output_paths(normalized_output, unknown_output, summary_output, raw_output),
         "state_paths": {key: str(path.resolve()) for key, path in states.items()},
-        "orchestrator_config": {"batch_size": settings.batch_size, "watermark_lag_seconds": settings.watermark_lag_seconds},
+        "orchestrator_config": {"batch_size": settings.batch_size, "watermark_lag_seconds": settings.watermark_lag_seconds, "peer_groups_path": str(Path(settings.peer_groups_path).resolve()) if settings.peer_groups_path else None},
     }
     state = _load_checkpoint(checkpoint_path, expected) if resume else None
     accumulator = QualityAccumulator.from_snapshot(_expand_quality_snapshot(state["quality"])) if state else QualityAccumulator()
@@ -181,7 +181,7 @@ def _checkpoint_ueba(
         features.advance_watermark(max_event_time - config.watermark_lag_seconds * 1000)
     # All Feature transactions, session state and downstream DBs must succeed before
     # the durable local commit point that authorizes a Kafka offset commit.
-    downstream = _run_downstream(states, max_event_time - config.watermark_lag_seconds * 1000 if max_event_time is not None else None)
+    downstream = _run_downstream(states, max_event_time - config.watermark_lag_seconds * 1000 if max_event_time is not None else None, config.peer_groups_path)
     if checkpoint_path is not None:
         _save_checkpoint(checkpoint_path, expected, accumulator, sinks, processed, next_offsets, max_event_time)
     else:
