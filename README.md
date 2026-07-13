@@ -21,6 +21,8 @@ conda run -n agent python -m pytest -q
 
 Kafka 连接器是可选依赖：`conda run -n agent pip install -e ".[kafka]"`。没有 Kafka 或该依赖时，本地文件解析和所有 fake-consumer 测试仍可使用。
 
+模型回测也是可选依赖：`conda run -n agent pip install -e ".[ml]"`。HBOS 仅使用标准库；Isolation Forest 需要 NumPy 和 scikit-learn，未安装时其他链路不受影响。
+
 **隐私：** `output/`、`data/`、根目录原始日志 dump、`.env` / 密钥类文件均在 `.gitignore` 中，默认不会进版本库。提交前请确认样例已脱敏。
 
 ## 10 分钟最小闭环
@@ -304,17 +306,34 @@ conda run -n agent python -m logfusion cases disposition \
   --case-id <case_id> --value confirmed_threat --actor alice
 ```
 
-## Detection Backtest & Evaluation v1
+## Detection Backtest & Evaluation v2
 
-Evaluation 使用 Feature、Baseline 和 Case DB 的只读快照，不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线，因此当天及未来行为不会泄露到参照分布中。检测语义复用同一份 Detection Policy，包括 P95/P99、低频/首次值规则、source type 覆盖，以及 personal → peer group → global 回退。
+Evaluation 使用 Feature、Baseline 和 Case DB 的只读快照，不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线或训练模型，因此当天及未来行为不会泄露到参照分布中。Evaluation DB v2 不兼容 v1；旧实验应删除状态库后从原始状态重跑。
+
+`statistical` 复用 Detection Policy 的 P95/P99、低频/首次值、source type 覆盖和 personal → peer group → global 回退。`hbos` 与 `isolation_forest` 使用相同的 13 维派生窗口特征，只在至少 5 名活跃成员、100 个真实窗口的 peer group 上训练，否则回退至少 100 个真实窗口的 global 模型。模型训练仍包含被评估用户自身的历史窗口，不做 leave-one-out。
 
 ```bash
 conda run -n agent python -m logfusion evaluate run \
   --feature-state output/features.db --baseline-state output/baseline.db \
   --case-state output/cases.db --state output/evaluation.db \
-  --policy-config config/detection.local.yaml --name detection-policy-v2 \
+  --detector statistical --policy-config config/detection.local.yaml \
+  --name statistical-v2 \
   --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z \
   --report-output output/evaluation-report.json
+
+conda run -n agent python -m logfusion evaluate run \
+  --feature-state output/features.db --baseline-state output/baseline.db \
+  --case-state output/cases.db --state output/evaluation.db \
+  --detector hbos --model-config config/model-detection.local.yaml \
+  --name hbos-v1 \
+  --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z
+
+conda run -n agent python -m logfusion evaluate run \
+  --feature-state output/features.db --baseline-state output/baseline.db \
+  --case-state output/cases.db --state output/evaluation.db \
+  --detector isolation_forest --model-config config/model-detection.local.yaml \
+  --name isolation-forest-v1 \
+  --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z
 
 conda run -n agent python -m logfusion evaluate query \
   --state output/evaluation.db --experiment-id <experiment_id>
@@ -323,9 +342,24 @@ conda run -n agent python -m logfusion evaluate compare \
   --state output/evaluation.db --experiment-id <id-a> --experiment-id <id-b>
 ```
 
-评估单位是 `user.name + UTC day`：当天所有 candidate 合并为最大分数、candidate 数量、detector、严重度和基线范围。与该用户日相交的 Case 作为标签；同日多个标签以 `confirmed_threat` 优先，其次是 `benign`，仅有 `unknown` 时不计标签。指标只在已标注样本上计算 TP、FP、FN、precision、recall 和 F1；不计算 TN 或 accuracy。未标注但有预测的用户日单独计数，**不等于误报**。
+模型配置示例：
 
-应先使用 Evaluation DB 比较统计策略及不同 policy，再引入 Isolation Forest 等模型；后续模型仍应输出可解释的 candidate evidence，并使用同一套评估契约。
+```yaml
+model_detection:
+  threshold_quantile: 0.995
+  min_training_samples: 100
+  min_peer_members: 5
+  top_feature_count: 3
+  hbos_min_bins: 5
+  hbos_max_bins: 20
+  isolation_forest_estimators: 200
+  isolation_forest_max_samples: 256
+  random_state: 42
+```
+
+HBOS 对每个特征建立等频直方图并保存贡献最大的三个特征。Isolation Forest 使用固定随机种子和 200 棵树；其 explanation 中的 robust deviation 只是调查辅助证据，不代表模型特征归因。两种模型都使用训练异常分的 P99.5 作为阈值，并保存每日训练范围、scope、样本数、原始分和 percentile，不持久化 sklearn 模型。
+
+评估单位是 `user.name + UTC day`：当天所有 candidate 合并为最大分数、candidate 数量、detector、严重度和基线范围。与该用户日相交的 Case 作为标签；同日多个标签以 `confirmed_threat` 优先，其次是 `benign`，仅有 `unknown` 时不计标签。指标只在已标注样本上计算 TP、FP、FN、precision、recall 和 F1；不计算 TN 或 accuracy。未标注预测、candidate 数、预测用户日数和平均每日预测量单独统计，**未标注预测不等于误报**。比较时优先关注 precision 与每日预测量，不会自动把任一模型接入生产链路。
 
 ## Parser 生命周期（unknown → active）
 
@@ -491,6 +525,7 @@ conda run -n agent python -m logfusion quality drift \
 | `baseline query` | 查询用户基线画像及对应全局参照 |
 | `detect run` | Feature DB + Baseline DB → 可解释的统计异常候选 DB |
 | `detect query` | 查询用户时间范围内相交的 active 异常候选 |
+| `evaluate run/query/compare` | 对统计、HBOS、Isolation Forest 做 point-in-time 用户日回测与实验比较 |
 | `correlate run` | Active anomaly candidates → 版本化跨系统 Incident DB |
 | `correlate query` | 查询用户时间范围内相交的 active Incident |
 | `fuse run` | Detection DB + Incident DB → 风险评估与策略控制后的告警 DB |
@@ -548,6 +583,8 @@ LogFusion/
 | `features.py` | SQLite FeatureEngine、窗口聚合、会话构建与 JSONL build/query |
 | `baseline.py` | SQLite BaselineEngine、个人/全局统计与值频次基线 |
 | `detection.py` | SQLite DetectionEngine、统计异常候选与 revision 替代 |
+| `model_detection.py` | Evaluation 专用派生特征、HBOS 与可选 Isolation Forest 检测器 |
+| `evaluation.py` | Point-in-time 基线/模型训练、用户日标签与实验指标持久化 |
 | `correlation.py` | SQLite CorrelationEngine、session/时间桶关联与 Incident 聚合 |
 | `fusion.py` | SQLite FusionEngine、风险评分、告警门槛、预算抑制与版本替代 |
 | `orchestrator.py` | 追加 JSONL 编排、event-time watermark、全链路推进与断点恢复 |

@@ -190,6 +190,41 @@ def load_detection_policy(path: Path) -> dict[str, Any]:
     return settings
 
 
+def load_model_detection_config(path: Path) -> dict[str, Any]:
+    """Load scalar model backtest settings from ``model_detection:``."""
+    settings: dict[str, Any] = {}
+    active = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        stripped = raw_line.strip()
+        if stripped == "model_detection:":
+            active = True
+            continue
+        if not raw_line[0].isspace() and stripped.endswith(":"):
+            active = False
+            continue
+        if active and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            settings[key.strip()] = _typed_value(value)
+    integer_keys = (
+        "min_training_samples", "min_peer_members", "top_feature_count", "hbos_min_bins", "hbos_max_bins",
+        "isolation_forest_estimators", "isolation_forest_max_samples", "random_state",
+    )
+    for key in integer_keys:
+        if key in settings:
+            try:
+                settings[key] = int(settings[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"model detection config {key} must be an integer") from exc
+    if "threshold_quantile" in settings:
+        try:
+            settings["threshold_quantile"] = float(settings["threshold_quantile"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("model detection config threshold_quantile must be numeric") from exc
+    return settings
+
+
 def _value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:

@@ -3,20 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 from pathlib import Path
 
-from logfusion.config import load_detection_policy, load_fusion_policy, load_kafka_config, load_llm_config, load_sources_config
+from logfusion.config import load_detection_policy, load_fusion_policy, load_kafka_config, load_llm_config, load_model_detection_config, load_sources_config
 from logfusion.baseline import BaselineEngine, BaselineError, query_baseline_state
 from logfusion.cases import CaseEngine, CaseError, get_case, list_cases
 from logfusion.correlation import CorrelationEngine, CorrelationError, query_incident_state
 from logfusion.detection import DetectionConfig, DetectionEngine, DetectionError, query_detection_state
-from logfusion.evaluation import EvaluationEngine, EvaluationError, _iso
+from logfusion.evaluation import EvaluationEngine, EvaluationError, compare_evaluation_state, query_evaluation_state
 from logfusion.features import FeatureError, build_features_from_jsonl, query_feature_state
 from logfusion.fusion import FusionConfig, FusionEngine, FusionError, query_risk_state
 from logfusion.orchestrator import OrchestratorConfig, OrchestratorError, run_continuous_pipeline
 from logfusion.kafka_source import KafkaConsumerError, run_kafka_streaming_pipeline
 from logfusion.kafka_ueba import run_kafka_ueba_pipeline
+from logfusion.model_detection import ModelDetectionConfig
 from logfusion.parser_candidates import propose_parser_candidates
 from logfusion.llm_generation import generate_and_validate_llm_candidates, generate_llm_candidates
 from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_run_parser.add_argument("--case-state", required=True)
     evaluate_run_parser.add_argument("--state", required=True)
     evaluate_run_parser.add_argument("--policy-config")
+    evaluate_run_parser.add_argument("--detector", choices=("statistical", "hbos", "isolation_forest"), default="statistical")
+    evaluate_run_parser.add_argument("--model-config")
     evaluate_run_parser.add_argument("--name", required=True)
     evaluate_run_parser.add_argument("--from", dest="from_time", required=True)
     evaluate_run_parser.add_argument("--to", dest="to_time", required=True)
@@ -554,43 +556,30 @@ def _handle_detect(args: argparse.Namespace) -> int:
 def _handle_evaluate(args: argparse.Namespace) -> int:
     try:
         if args.evaluate_command == "run":
+            if args.detector == "statistical" and args.model_config:
+                raise EvaluationError("--model-config is only valid for model detectors")
+            if args.detector != "statistical" and args.policy_config:
+                raise EvaluationError("--policy-config is only valid for the statistical detector")
             settings = load_detection_policy(Path(args.policy_config)) if args.policy_config else {}
-            with EvaluationEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.case_state), Path(args.state), DetectionConfig(**settings)) as engine:
+            model_settings = load_model_detection_config(Path(args.model_config)) if args.model_config else {}
+            model_config = ModelDetectionConfig(**model_settings)
+            model_config.validate()
+            with EvaluationEngine(
+                Path(args.feature_state), Path(args.baseline_state), Path(args.case_state), Path(args.state),
+                DetectionConfig(**settings), args.detector, model_config,
+            ) as engine:
                 report = engine.run(args.name, args.from_time, args.to_time)
             if args.report_output:
                 _write_json(Path(args.report_output), report)
-        elif args.evaluate_command in {"query", "compare"}:
-            # Query and compare only need the Evaluation DB, but the engine constructor
-            # deliberately validates production inputs. Use its persisted schema directly.
-            connection = sqlite3.connect(Path(args.state))
-            connection.row_factory = sqlite3.Row
-            try:
-                if args.evaluate_command == "query":
-                    row = connection.execute("SELECT * FROM experiments WHERE experiment_id = ?", (args.experiment_id,)).fetchone()
-                    metrics = connection.execute("SELECT * FROM experiment_metrics WHERE experiment_id = ?", (args.experiment_id,)).fetchone()
-                    if row is None:
-                        raise EvaluationError(f"experiment does not exist: {args.experiment_id}")
-                    report = dict(row)
-                    report["from"] = _iso(report.pop("start_ms"))
-                    report["to"] = _iso(report.pop("end_ms"))
-                    report["metrics"] = dict(metrics) if metrics else {}
-                else:
-                    if len(args.experiment_id) != 2:
-                        raise EvaluationError("evaluate compare requires exactly two --experiment-id values")
-                    def read(experiment_id: str) -> dict:
-                        row = connection.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
-                        metric = connection.execute("SELECT * FROM experiment_metrics WHERE experiment_id = ?", (experiment_id,)).fetchone()
-                        if row is None:
-                            raise EvaluationError(f"experiment does not exist: {experiment_id}")
-                        return {"experiment_id": experiment_id, "name": row["name"], "metrics": dict(metric) if metric else {}}
-                    left, right = read(args.experiment_id[0]), read(args.experiment_id[1])
-                    fields = ("true_positive", "false_positive", "false_negative", "precision", "recall", "f1", "unlabeled_predictions")
-                    report = {"left": left, "right": right, "delta": {field: right["metrics"].get(field, 0) - left["metrics"].get(field, 0) for field in fields}}
-            finally:
-                connection.close()
+        elif args.evaluate_command == "query":
+            report = query_evaluation_state(Path(args.state), args.experiment_id)
+        elif args.evaluate_command == "compare":
+            if len(args.experiment_id) != 2:
+                raise EvaluationError("evaluate compare requires exactly two --experiment-id values")
+            report = compare_evaluation_state(Path(args.state), args.experiment_id[0], args.experiment_id[1])
         else:
             return 2
-    except (EvaluationError, sqlite3.Error) as exc:
+    except (EvaluationError, ValueError) as exc:
         print(str(exc))
         return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))

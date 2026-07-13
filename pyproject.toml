@@ -16,6 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 kafka = ["confluent-kafka>=2.0"]
+ml = ["numpy>=1.24,<3", "scikit-learn>=1.4,<2"]
 
 [project.scripts]
 logfusion = "logfusion.cli:main"

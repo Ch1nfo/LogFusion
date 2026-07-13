@@ -1,0 +1,10 @@
+model_detection:
+  threshold_quantile: 0.995
+  min_training_samples: 100
+  min_peer_members: 5
+  top_feature_count: 3
+  hbos_min_bins: 5
+  hbos_max_bins: 20
+  isolation_forest_estimators: 200
+  isolation_forest_max_samples: 256
+  random_state: 42
