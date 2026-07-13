@@ -84,3 +84,24 @@ def test_case_suppression_refreshes_fusion_without_deleting_assessment(tmp_path)
     assert report["suppressed_count"] >= 1
     assert all(alert["alert_key"] != alert_key for alert in result["alerts"])
     assert any(row["policy_action"] == "suppressed_by_case_policy" for row in result["assessments"])
+
+
+def test_case_disposition_is_independent_from_lifecycle_and_audited(tmp_path):
+    _, _, detection_db, incident_db, risk_db = _seed_incidents(tmp_path)
+    with FusionEngine(detection_db, incident_db, risk_db) as fusion:
+        fusion.run()
+    case_db = tmp_path / "cases.db"
+    with CaseEngine(risk_db, case_db) as cases:
+        cases.sync()
+        case_id = cases.list()[0]["case_id"]
+        assert cases.get(case_id)["disposition"] == "unknown"
+        updated = cases.set_disposition(case_id, "confirmed_threat", "analyst", "validated compromise")
+        assert updated["disposition"] == "confirmed_threat"
+        assert updated["status"] == "new"
+        assert any(event["event_type"] == "disposition_changed" for event in updated["events"])
+        try:
+            cases.set_disposition(case_id, "invalid", "analyst")
+        except CaseError as error:
+            assert "disposition" in str(error)
+        else:  # pragma: no cover
+            raise AssertionError("invalid disposition should fail")

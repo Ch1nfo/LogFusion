@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 from logfusion.config import load_detection_policy, load_fusion_policy, load_kafka_config, load_llm_config, load_sources_config
@@ -10,6 +11,7 @@ from logfusion.baseline import BaselineEngine, BaselineError, query_baseline_sta
 from logfusion.cases import CaseEngine, CaseError, get_case, list_cases
 from logfusion.correlation import CorrelationEngine, CorrelationError, query_incident_state
 from logfusion.detection import DetectionConfig, DetectionEngine, DetectionError, query_detection_state
+from logfusion.evaluation import EvaluationEngine, EvaluationError, _iso
 from logfusion.features import FeatureError, build_features_from_jsonl, query_feature_state
 from logfusion.fusion import FusionConfig, FusionEngine, FusionError, query_risk_state
 from logfusion.orchestrator import OrchestratorConfig, OrchestratorError, run_continuous_pipeline
@@ -112,6 +114,25 @@ def main(argv: list[str] | None = None) -> int:
     detect_query_parser.add_argument("--from", dest="from_time", required=True)
     detect_query_parser.add_argument("--to", dest="to_time", required=True)
 
+    evaluate_parser = subparsers.add_parser("evaluate")
+    evaluate_subparsers = evaluate_parser.add_subparsers(dest="evaluate_command", required=True)
+    evaluate_run_parser = evaluate_subparsers.add_parser("run")
+    evaluate_run_parser.add_argument("--feature-state", required=True)
+    evaluate_run_parser.add_argument("--baseline-state", required=True)
+    evaluate_run_parser.add_argument("--case-state", required=True)
+    evaluate_run_parser.add_argument("--state", required=True)
+    evaluate_run_parser.add_argument("--policy-config")
+    evaluate_run_parser.add_argument("--name", required=True)
+    evaluate_run_parser.add_argument("--from", dest="from_time", required=True)
+    evaluate_run_parser.add_argument("--to", dest="to_time", required=True)
+    evaluate_run_parser.add_argument("--report-output")
+    evaluate_query_parser = evaluate_subparsers.add_parser("query")
+    evaluate_query_parser.add_argument("--state", required=True)
+    evaluate_query_parser.add_argument("--experiment-id", required=True)
+    evaluate_compare_parser = evaluate_subparsers.add_parser("compare")
+    evaluate_compare_parser.add_argument("--state", required=True)
+    evaluate_compare_parser.add_argument("--experiment-id", action="append", required=True)
+
     correlate_parser = subparsers.add_parser("correlate")
     correlate_subparsers = correlate_parser.add_subparsers(dest="correlate_command", required=True)
     correlate_run_parser = correlate_subparsers.add_parser("run")
@@ -194,6 +215,13 @@ def main(argv: list[str] | None = None) -> int:
     cases_tags_parser.add_argument("--case-id", required=True)
     cases_tags_parser.add_argument("--actor", required=True)
     cases_tags_parser.add_argument("--tag", action="append", required=True)
+    cases_disposition_parser = cases_subparsers.add_parser("disposition")
+    cases_disposition_parser.add_argument("--risk-state", required=True)
+    cases_disposition_parser.add_argument("--state", required=True)
+    cases_disposition_parser.add_argument("--case-id", required=True)
+    cases_disposition_parser.add_argument("--value", required=True)
+    cases_disposition_parser.add_argument("--actor", required=True)
+    cases_disposition_parser.add_argument("--note")
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -294,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_baseline(args)
     if args.command == "detect":
         return _handle_detect(args)
+    if args.command == "evaluate":
+        return _handle_evaluate(args)
     if args.command == "correlate":
         return _handle_correlate(args)
     if args.command == "fuse":
@@ -521,6 +551,52 @@ def _handle_detect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_evaluate(args: argparse.Namespace) -> int:
+    try:
+        if args.evaluate_command == "run":
+            settings = load_detection_policy(Path(args.policy_config)) if args.policy_config else {}
+            with EvaluationEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.case_state), Path(args.state), DetectionConfig(**settings)) as engine:
+                report = engine.run(args.name, args.from_time, args.to_time)
+            if args.report_output:
+                _write_json(Path(args.report_output), report)
+        elif args.evaluate_command in {"query", "compare"}:
+            # Query and compare only need the Evaluation DB, but the engine constructor
+            # deliberately validates production inputs. Use its persisted schema directly.
+            connection = sqlite3.connect(Path(args.state))
+            connection.row_factory = sqlite3.Row
+            try:
+                if args.evaluate_command == "query":
+                    row = connection.execute("SELECT * FROM experiments WHERE experiment_id = ?", (args.experiment_id,)).fetchone()
+                    metrics = connection.execute("SELECT * FROM experiment_metrics WHERE experiment_id = ?", (args.experiment_id,)).fetchone()
+                    if row is None:
+                        raise EvaluationError(f"experiment does not exist: {args.experiment_id}")
+                    report = dict(row)
+                    report["from"] = _iso(report.pop("start_ms"))
+                    report["to"] = _iso(report.pop("end_ms"))
+                    report["metrics"] = dict(metrics) if metrics else {}
+                else:
+                    if len(args.experiment_id) != 2:
+                        raise EvaluationError("evaluate compare requires exactly two --experiment-id values")
+                    def read(experiment_id: str) -> dict:
+                        row = connection.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
+                        metric = connection.execute("SELECT * FROM experiment_metrics WHERE experiment_id = ?", (experiment_id,)).fetchone()
+                        if row is None:
+                            raise EvaluationError(f"experiment does not exist: {experiment_id}")
+                        return {"experiment_id": experiment_id, "name": row["name"], "metrics": dict(metric) if metric else {}}
+                    left, right = read(args.experiment_id[0]), read(args.experiment_id[1])
+                    fields = ("true_positive", "false_positive", "false_negative", "precision", "recall", "f1", "unlabeled_predictions")
+                    report = {"left": left, "right": right, "delta": {field: right["metrics"].get(field, 0) - left["metrics"].get(field, 0) for field in fields}}
+            finally:
+                connection.close()
+        else:
+            return 2
+    except (EvaluationError, sqlite3.Error) as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _handle_correlate(args: argparse.Namespace) -> int:
     try:
         if args.correlate_command == "run":
@@ -585,7 +661,7 @@ def _handle_cases(args: argparse.Namespace) -> int:
             report = list_cases(Path(args.state), args.user, args.status)
         elif args.cases_command == "show":
             report = get_case(Path(args.state), args.case_id)
-        elif args.cases_command in {"transition", "assign", "comment", "set-tags"}:
+        elif args.cases_command in {"transition", "assign", "comment", "set-tags", "disposition"}:
             with CaseEngine(Path(args.risk_state), Path(args.state)) as engine:
                 if args.cases_command == "transition":
                     report = engine.transition(args.case_id, args.status, args.actor, args.note, args.suppression_until)
@@ -594,7 +670,7 @@ def _handle_cases(args: argparse.Namespace) -> int:
                 elif args.cases_command == "comment":
                     report = engine.comment(args.case_id, args.actor, args.note)
                 else:
-                    report = engine.set_tags(args.case_id, args.tag, args.actor)
+                    report = engine.set_disposition(args.case_id, args.value, args.actor, args.note) if args.cases_command == "disposition" else engine.set_tags(args.case_id, args.tag, args.actor)
         else:
             return 2
     except CaseError as exc:

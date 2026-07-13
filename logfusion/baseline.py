@@ -428,6 +428,7 @@ class BaselineEngine:
                 "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "feature_config_fingerprint": self.feature_config_fingerprint,
                 "baseline_config_fingerprint": fingerprint,
+                "baseline_config_json": json.dumps(asdict(self.config), sort_keys=True, separators=(",", ":")),
                 "peer_groups_fingerprint": self.peer_groups_fingerprint,
                 "last_consumed_revision": "0",
             }
@@ -441,6 +442,9 @@ class BaselineEngine:
             raise BaselineError("feature configuration changed; rebuild Baseline DB")
         if self._meta("baseline_config_fingerprint") != fingerprint:
             raise BaselineError("baseline configuration changed; rebuild Baseline DB")
+        if self._meta("baseline_config_json") is None:
+            self._set_meta("baseline_config_json", json.dumps(asdict(self.config), sort_keys=True, separators=(",", ":")))
+            self.connection.commit()
         if self._meta("peer_groups_fingerprint") != self.peer_groups_fingerprint:
             raise BaselineError("peer group mapping changed; rebuild Baseline DB")
 

@@ -12,6 +12,7 @@ from typing import Any, Iterator
 CASE_SCHEMA_VERSION = "1"
 FUSION_SCHEMA_VERSION = "1"
 CASE_STATUSES = ("new", "acknowledged", "investigating", "resolved", "false_positive", "suppressed")
+CASE_DISPOSITIONS = ("confirmed_threat", "benign", "unknown")
 TERMINAL_CASE_STATUSES = {"resolved", "false_positive"}
 
 
@@ -167,6 +168,16 @@ class CaseEngine:
             self._append_event(case_id, "tags_changed", actor, {"from": json.loads(row["tags_json"]), "to": normalized}, now)
         return self.get(case_id)
 
+    def set_disposition(self, case_id: str, value: str, actor: str, note: str | None = None) -> dict[str, Any]:
+        if value not in CASE_DISPOSITIONS or not actor.strip():
+            raise CaseError("valid disposition and actor are required")
+        now = _now_ms()
+        with self._transaction():
+            row = self._case_row(case_id)
+            self.connection.execute("UPDATE cases SET disposition = ?, updated_at = ? WHERE case_id = ?", (value, now, case_id))
+            self._append_event(case_id, "disposition_changed", actor, {"from": row["disposition"], "to": value, "note": note}, now)
+        return self.get(case_id)
+
     def list(self, user_name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         if status is not None and status not in CASE_STATUSES:
             raise CaseError(f"unsupported case status: {status}")
@@ -205,7 +216,7 @@ class CaseEngine:
                 user_name TEXT NOT NULL, incident_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
                 risk_score INTEGER NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, owner TEXT,
                 tags_json TEXT NOT NULL, suppression_until INTEGER, requires_review INTEGER NOT NULL,
-                source_correlation_revision INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                source_correlation_revision INTEGER NOT NULL, disposition TEXT NOT NULL DEFAULT 'unknown', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS case_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL, event_type TEXT NOT NULL,
@@ -218,6 +229,10 @@ class CaseEngine:
             """
         )
         self.connection.commit()
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(cases)")}
+        if "disposition" not in columns:
+            self.connection.execute("ALTER TABLE cases ADD COLUMN disposition TEXT NOT NULL DEFAULT 'unknown'")
+            self.connection.commit()
 
     def _initialize_meta(self) -> None:
         existing = self._meta("case_schema_version")

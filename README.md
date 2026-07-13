@@ -296,6 +296,37 @@ conda run -n agent python -m logfusion cases transition \
 
 支持 `new`、`acknowledged`、`investigating`、`resolved`、`false_positive`、`suppressed` 状态，以及 `assign`、`comment`、`set-tags`。`suppressed` 必须指定未来的 `--suppression-until`；到期后下一次 `cases sync` 自动恢复为 `new`。所有操作都写入 Case DB 的审计事件。终态 Case 收到新的风险告警版本时保持原结论，但标记 `requires_review: true`，由分析员决定是否重新打开。
 
+Case 的处置结论（`disposition`）与生命周期状态独立：`confirmed_threat` 是回测正样本、`benign` 是负样本、默认 `unknown` 不参与准确率。它不会改变 `status`，可通过以下命令记录并保留审计轨迹：
+
+```bash
+conda run -n agent python -m logfusion cases disposition \
+  --risk-state output/risk.db --state output/cases.db \
+  --case-id <case_id> --value confirmed_threat --actor alice
+```
+
+## Detection Backtest & Evaluation v1
+
+Evaluation 使用 Feature、Baseline 和 Case DB 的只读快照，不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线，因此当天及未来行为不会泄露到参照分布中。检测语义复用同一份 Detection Policy，包括 P95/P99、低频/首次值规则、source type 覆盖，以及 personal → peer group → global 回退。
+
+```bash
+conda run -n agent python -m logfusion evaluate run \
+  --feature-state output/features.db --baseline-state output/baseline.db \
+  --case-state output/cases.db --state output/evaluation.db \
+  --policy-config config/detection.local.yaml --name detection-policy-v2 \
+  --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z \
+  --report-output output/evaluation-report.json
+
+conda run -n agent python -m logfusion evaluate query \
+  --state output/evaluation.db --experiment-id <experiment_id>
+
+conda run -n agent python -m logfusion evaluate compare \
+  --state output/evaluation.db --experiment-id <id-a> --experiment-id <id-b>
+```
+
+评估单位是 `user.name + UTC day`：当天所有 candidate 合并为最大分数、candidate 数量、detector、严重度和基线范围。与该用户日相交的 Case 作为标签；同日多个标签以 `confirmed_threat` 优先，其次是 `benign`，仅有 `unknown` 时不计标签。指标只在已标注样本上计算 TP、FP、FN、precision、recall 和 F1；不计算 TN 或 accuracy。未标注但有预测的用户日单独计数，**不等于误报**。
+
+应先使用 Evaluation DB 比较统计策略及不同 policy，再引入 Isolation Forest 等模型；后续模型仍应输出可解释的 candidate evidence，并使用同一套评估契约。
+
 ## Parser 生命周期（unknown → active）
 
 用 unknown 样例走一遍完整路径：
