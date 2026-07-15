@@ -347,7 +347,7 @@ class ConsoleApp:
 
     def _readiness(self) -> str:
         readiness = self._readiness_data()
-        body = "<header class='page-head'><div><p class='eyebrow'>DATA READINESS</p><h1>数据准备度</h1><p>训练可用不等于效果可评估；历史和两类标签必须分别达标。</p></div>"
+        body = "<header class='page-head'><div><p class='eyebrow'>DATA READINESS</p><h1>数据准备度</h1><p>仅检查无监督检测所需的历史跨度、窗口样本和群体覆盖。</p></div>"
         if not self.demo:
             body += _post_button("/jobs/readiness", "重新检查", self.csrf_token)
         body += "</header><section class='panel'>" + _readiness_summary(readiness, detailed=True) + "</section>"
@@ -357,19 +357,19 @@ class ConsoleApp:
 
     def _experiments(self) -> str:
         experiments = self.demo_data["experiments"] if self.demo_data else _experiment_data(self.project)
-        rows = [[item.get("name", "—"), item.get("detector_id", "—"), _metric(item, "precision"), _metric(item, "recall"), _metric(item, "average_daily_predictions"), item.get("from", "—")] for item in experiments]
-        body = "<header class='page-head'><div><p class='eyebrow'>EVALUATION</p><h1>检测实验</h1><p>在相同 UTC 范围内比较模型效果和每日预测量。</p></div></header>"
+        rows = [[item.get("name", "—"), item.get("detector_id", "—"), _metric(item, "candidate_count"), _metric(item, "unique_predicted_users"), _metric(item, "average_daily_predictions"), _metric(item, "daily_prediction_cv"), item.get("from", "—")] for item in experiments]
+        body = "<header class='page-head'><div><p class='eyebrow'>EVALUATION</p><h1>检测实验</h1><p>在相同 UTC 范围内比较无监督检测量、覆盖面和稳定性。</p></div></header>"
         if not self.demo:
             body += _experiment_form(self.csrf_token)
-        body += "<section class='panel'>" + _table(["实验", "检测器", "Precision", "Recall", "每日预测", "起始时间"], rows, "尚无实验") + "</section>"
+        body += "<section class='panel'>" + _table(["实验", "检测器", "Candidate", "异常用户", "每日预测", "日波动 CV", "起始时间"], rows, "尚无实验") + "</section>"
         return _layout("检测实验", "experiments", body, self.demo)
 
     def _cases(self) -> str:
         cases = self.demo_data["cases"] if self.demo_data else self._case_data()
-        rows = [[item.get("user_name", "—"), item.get("status", "—"), item.get("severity", "—"), item.get("risk_score", "—"), item.get("disposition", "unknown"), item.get("last_seen", "—")] for item in cases]
-        body = "<header class='page-head'><div><p class='eyebrow'>INVESTIGATION</p><h1>Cases</h1><p>机器告警和人工结论分离保存。</p></div></header>"
-        body += "<section class='panel'>" + _table(["用户", "状态", "严重度", "风险分", "处置结论", "最后出现"], rows, "尚无 Case") + "</section>"
-        body += "<section class='notice'><strong>下一阶段</strong><span>证据时间线、评论、负责人和一键 disposition。</span></section>"
+        rows = [[item.get("user_name", "—"), item.get("status", "—"), item.get("severity", "—"), item.get("risk_score", "—"), item.get("owner") or "—", item.get("last_seen", "—")] for item in cases]
+        body = "<header class='page-head'><div><p class='eyebrow'>INVESTIGATION</p><h1>Cases</h1><p>Case 只服务调查、处置和审计，不产生模型训练标签。</p></div></header>"
+        body += "<section class='panel'>" + _table(["用户", "状态", "严重度", "风险分", "负责人", "最后出现"], rows, "尚无 Case") + "</section>"
+        body += "<section class='notice'><strong>下一阶段</strong><span>证据时间线、评论、负责人和处置状态操作。</span></section>"
         return _layout("Cases", "cases", body, self.demo)
 
     def _submit_readiness(self, environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
@@ -590,7 +590,6 @@ def build_job_command(project: ProjectConfig, kind: str, arguments: dict[str, An
             "evaluate", "readiness",
             "--feature-state", str(project.state("feature")),
             "--baseline-state", str(project.state("baseline")),
-            "--case-state", str(project.state("case")),
             "--report-output", str(project.resolve("files", "readiness_report")),
         ]
         model_config = project.resolve("files", "model_detection")
@@ -614,7 +613,6 @@ def build_job_command(project: ProjectConfig, kind: str, arguments: dict[str, An
             "evaluate", "run",
             "--feature-state", str(project.state("feature")),
             "--baseline-state", str(project.state("baseline")),
-            "--case-state", str(project.state("case")),
             "--state", str(project.state("evaluation")),
             "--detector", detector,
             "--name", str(arguments["name"]),
@@ -660,31 +658,26 @@ def _demo_document() -> dict[str, Any]:
         ],
         "readiness": {
             "history": {"observed_days": 21, "target_days": 30, "missing_days": 9, "ready": False},
-            "labels": {
-                "confirmed_threat_user_days": {"current": 8, "target": 30, "missing": 22, "ready": False},
-                "benign_user_days": {"current": 43, "target": 100, "missing": 57, "ready": False},
-            },
             "detectors": {
-                "statistical": {"training_status": "ready", "evaluation_ready": False},
-                "hbos": {"training_status": "ready", "evaluation_ready": False},
-                "isolation_forest": {"training_status": "ready", "evaluation_ready": False},
+                "statistical": {"training_status": "not_ready", "evaluation_ready": False, "evaluation_mode": "unsupervised"},
+                "hbos": {"training_status": "not_ready", "evaluation_ready": False, "evaluation_mode": "unsupervised"},
+                "isolation_forest": {"training_status": "not_ready", "evaluation_ready": False, "evaluation_mode": "unsupervised"},
             },
             "next_actions": [
                 {"message": "继续采集 9 个 UTC 自然日。"},
-                {"message": "补充 22 个 confirmed-threat 用户日。"},
-                {"message": "补充 57 个 benign 用户日。"},
+                {"message": "继续积累各窗口的真实行为样本。"},
             ],
         },
         "experiments": [
-            {"name": "statistical-demo", "detector_id": "statistical", "from": "2026-06-01", "metrics": {"precision": 0.71, "recall": 0.64, "average_daily_predictions": 18.4}},
-            {"name": "hbos-demo", "detector_id": "hbos", "from": "2026-06-01", "metrics": {"precision": 0.78, "recall": 0.59, "average_daily_predictions": 12.1}},
-            {"name": "iforest-demo", "detector_id": "isolation_forest", "from": "2026-06-01", "metrics": {"precision": 0.76, "recall": 0.68, "average_daily_predictions": 15.3}},
+            {"name": "statistical-demo", "detector_id": "statistical", "from": "2026-06-01", "metrics": {"candidate_count": 162, "unique_predicted_users": 34, "average_daily_predictions": 18.4, "daily_prediction_cv": 0.31}},
+            {"name": "hbos-demo", "detector_id": "hbos", "from": "2026-06-01", "metrics": {"candidate_count": 104, "unique_predicted_users": 27, "average_daily_predictions": 12.1, "daily_prediction_cv": 0.24}},
+            {"name": "iforest-demo", "detector_id": "isolation_forest", "from": "2026-06-01", "metrics": {"candidate_count": 131, "unique_predicted_users": 31, "average_daily_predictions": 15.3, "daily_prediction_cv": 0.28}},
         ],
         "cases": [
-            {"user_name": "wangkun78", "status": "investigating", "severity": "critical", "risk_score": 94, "disposition": "unknown", "last_seen": "2026-07-13T11:35:00Z"},
-            {"user_name": "ops-admin", "status": "new", "severity": "high", "risk_score": 86, "disposition": "unknown", "last_seen": "2026-07-13T09:10:00Z"},
-            {"user_name": "lihua", "status": "resolved", "severity": "high", "risk_score": 82, "disposition": "confirmed_threat", "last_seen": "2026-07-12T18:45:00Z"},
-            {"user_name": "zhangsan", "status": "false_positive", "severity": "high", "risk_score": 80, "disposition": "benign", "last_seen": "2026-07-12T03:22:00Z"},
+            {"user_name": "wangkun78", "status": "investigating", "severity": "critical", "risk_score": 94, "owner": "alice", "last_seen": "2026-07-13T11:35:00Z"},
+            {"user_name": "ops-admin", "status": "new", "severity": "high", "risk_score": 86, "owner": None, "last_seen": "2026-07-13T09:10:00Z"},
+            {"user_name": "lihua", "status": "resolved", "severity": "high", "risk_score": 82, "owner": "bob", "last_seen": "2026-07-12T18:45:00Z"},
+            {"user_name": "zhangsan", "status": "false_positive", "severity": "high", "risk_score": 80, "owner": "alice", "last_seen": "2026-07-12T03:22:00Z"},
         ],
     }
 
@@ -713,7 +706,7 @@ def _experiment_data(project: ProjectConfig) -> list[dict[str, Any]]:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         rows = connection.execute("""
-            SELECT e.*,m.precision,m.recall,m.f1,m.average_daily_predictions
+            SELECT e.*,m.candidate_count,m.unique_predicted_users,m.average_daily_predictions,m.daily_prediction_cv
             FROM experiments e LEFT JOIN experiment_metrics m USING(experiment_id)
             ORDER BY e.created_at DESC
         """).fetchall()
@@ -723,7 +716,7 @@ def _experiment_data(project: ProjectConfig) -> list[dict[str, Any]]:
             item = dict(row)
             item["from"] = _iso_ms(item.pop("start_ms"))
             item["to"] = _iso_ms(item.pop("end_ms"))
-            item["metrics"] = {key: item.pop(key) for key in ("precision", "recall", "f1", "average_daily_predictions")}
+            item["metrics"] = {key: item.pop(key) for key in ("candidate_count", "unique_predicted_users", "average_daily_predictions", "daily_prediction_cv")}
             result.append(item)
         return result
     except sqlite3.Error:
@@ -772,11 +765,8 @@ def _readiness_summary(report: dict[str, Any], detailed: bool = False) -> str:
     if not report:
         return "<p class='empty'>尚未生成准备度报告。点击“重新检查”后查看。</p>"
     history = report.get("history", {})
-    labels = report.get("labels", {})
     items = [
         ("历史数据", history.get("observed_days", 0), history.get("target_days", 30)),
-        ("确认威胁", labels.get("confirmed_threat_user_days", {}).get("current", 0), labels.get("confirmed_threat_user_days", {}).get("target", 30)),
-        ("Benign", labels.get("benign_user_days", {}).get("current", 0), labels.get("benign_user_days", {}).get("target", 100)),
     ]
     result = "<div class='progress-list'>"
     for label, current, target in items:
@@ -785,7 +775,7 @@ def _readiness_summary(report: dict[str, Any], detailed: bool = False) -> str:
     result += "</div>"
     if detailed:
         detectors = report.get("detectors", {})
-        result += "<div class='detectors'>" + "".join(f"<article><strong>{_e(name)}</strong><span>{_e(item.get('training_status', 'unknown'))}</span><small>{'可评估' if item.get('evaluation_ready') else '标签未就绪'}</small></article>" for name, item in detectors.items()) + "</div>"
+        result += "<div class='detectors'>" + "".join(f"<article><strong>{_e(name)}</strong><span>{_e(item.get('training_status', 'unknown'))}</span><small>{'可运行无监督评估' if item.get('evaluation_ready') else '训练数据未就绪'}</small></article>" for name, item in detectors.items()) + "</div>"
     return result
 
 

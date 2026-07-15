@@ -156,7 +156,6 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_run_parser = evaluate_subparsers.add_parser("run")
     evaluate_run_parser.add_argument("--feature-state", required=True)
     evaluate_run_parser.add_argument("--baseline-state", required=True)
-    evaluate_run_parser.add_argument("--case-state", required=True)
     evaluate_run_parser.add_argument("--state", required=True)
     evaluate_run_parser.add_argument("--policy-config")
     evaluate_run_parser.add_argument("--detector", choices=("statistical", "hbos", "isolation_forest"), default="statistical")
@@ -174,7 +173,6 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_readiness_parser = evaluate_subparsers.add_parser("readiness")
     evaluate_readiness_parser.add_argument("--feature-state", required=True)
     evaluate_readiness_parser.add_argument("--baseline-state", required=True)
-    evaluate_readiness_parser.add_argument("--case-state", required=True)
     evaluate_readiness_parser.add_argument("--model-config")
     evaluate_readiness_parser.add_argument("--as-of")
     evaluate_readiness_parser.add_argument("--report-output")
@@ -262,13 +260,6 @@ def main(argv: list[str] | None = None) -> int:
     cases_tags_parser.add_argument("--case-id", required=True)
     cases_tags_parser.add_argument("--actor", required=True)
     cases_tags_parser.add_argument("--tag", action="append", required=True)
-    cases_disposition_parser = cases_subparsers.add_parser("disposition")
-    cases_disposition_parser.add_argument("--risk-state", required=True)
-    cases_disposition_parser.add_argument("--state", required=True)
-    cases_disposition_parser.add_argument("--case-id", required=True)
-    cases_disposition_parser.add_argument("--value", required=True)
-    cases_disposition_parser.add_argument("--actor", required=True)
-    cases_disposition_parser.add_argument("--note")
 
     propose_parser = subparsers.add_parser("propose-parsers")
     propose_parser.add_argument("--unknown-input", required=True)
@@ -649,7 +640,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             model_config = ModelDetectionConfig(**model_settings)
             model_config.validate()
             with EvaluationEngine(
-                Path(args.feature_state), Path(args.baseline_state), Path(args.case_state), Path(args.state),
+                Path(args.feature_state), Path(args.baseline_state), Path(args.state),
                 DetectionConfig(**settings), args.detector, model_config,
             ) as engine:
                 report = engine.run(args.name, args.from_time, args.to_time)
@@ -664,8 +655,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
         elif args.evaluate_command == "readiness":
             model_settings = load_model_detection_config(Path(args.model_config)) if args.model_config else {}
             with ReadinessEngine(
-                Path(args.feature_state), Path(args.baseline_state), Path(args.case_state),
-                ModelDetectionConfig(**model_settings),
+                Path(args.feature_state), Path(args.baseline_state), ModelDetectionConfig(**model_settings),
             ) as engine:
                 report = engine.report(args.as_of)
             if args.report_output:
@@ -743,7 +733,7 @@ def _handle_cases(args: argparse.Namespace) -> int:
             report = list_cases(Path(args.state), args.user, args.status)
         elif args.cases_command == "show":
             report = get_case(Path(args.state), args.case_id)
-        elif args.cases_command in {"transition", "assign", "comment", "set-tags", "disposition"}:
+        elif args.cases_command in {"transition", "assign", "comment", "set-tags"}:
             with CaseEngine(Path(args.risk_state), Path(args.state)) as engine:
                 if args.cases_command == "transition":
                     report = engine.transition(args.case_id, args.status, args.actor, args.note, args.suppression_until)
@@ -752,7 +742,7 @@ def _handle_cases(args: argparse.Namespace) -> int:
                 elif args.cases_command == "comment":
                     report = engine.comment(args.case_id, args.actor, args.note)
                 else:
-                    report = engine.set_disposition(args.case_id, args.value, args.actor, args.note) if args.cases_command == "disposition" else engine.set_tags(args.case_id, args.tag, args.actor)
+                    report = engine.set_tags(args.case_id, args.tag, args.actor)
         else:
             return 2
     except CaseError as exc:

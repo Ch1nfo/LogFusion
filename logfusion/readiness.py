@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from logfusion.baseline import BASELINE_SCHEMA_VERSION, BaselineConfig
-from logfusion.cases import CASE_SCHEMA_VERSION
 from logfusion.detection import FEATURE_SCHEMA_VERSION, WINDOW_SIZES
 from logfusion.model_detection import ModelDetectionConfig, ModelDetectionError
 
@@ -23,35 +22,31 @@ class ReadinessError(ValueError):
 @dataclass(frozen=True)
 class ReadinessTargets:
     history_days: int = 30
-    confirmed_threat_user_days: int = 30
-    benign_user_days: int = 100
 
 
 class ReadinessEngine:
-    """Produces a read-only training and evaluation data readiness report."""
+    """Produces a read-only readiness report for unlabeled detector training."""
 
     def __init__(
         self,
         feature_state: Path | str,
         baseline_state: Path | str,
-        case_state: Path | str,
         model_config: ModelDetectionConfig | None = None,
         targets: ReadinessTargets | None = None,
     ) -> None:
-        self.feature_path, self.baseline_path, self.case_path = map(Path, (feature_state, baseline_state, case_state))
-        if not all(path.exists() for path in (self.feature_path, self.baseline_path, self.case_path)):
-            raise ReadinessError("feature state, baseline state, and case state must exist")
+        self.feature_path, self.baseline_path = map(Path, (feature_state, baseline_state))
+        if not all(path.exists() for path in (self.feature_path, self.baseline_path)):
+            raise ReadinessError("feature state and baseline state must exist")
         self.model_config = model_config or ModelDetectionConfig()
         self.targets = targets or ReadinessTargets()
         try:
             self.model_config.validate()
         except ModelDetectionError as exc:
             raise ReadinessError(str(exc)) from exc
-        if min(self.targets.history_days, self.targets.confirmed_threat_user_days, self.targets.benign_user_days) <= 0:
+        if self.targets.history_days <= 0:
             raise ReadinessError("readiness targets must be positive")
         self.feature = _readonly(self.feature_path)
         self.baseline = _readonly(self.baseline_path)
-        self.cases = _readonly(self.case_path)
         try:
             self._verify_inputs()
         except BaseException:
@@ -61,7 +56,6 @@ class ReadinessEngine:
     def close(self) -> None:
         self.feature.close()
         self.baseline.close()
-        self.cases.close()
 
     def __enter__(self) -> "ReadinessEngine":
         return self
@@ -80,25 +74,22 @@ class ReadinessEngine:
         history = self._history(first_event, latest_event, as_of_ms)
         windows = {str(size): self._window_readiness(size, history_start, as_of_ms) for size in WINDOW_SIZES}
         peer_groups = self._peer_group_readiness(history_start, as_of_ms)
-        labels = self._label_readiness(max(first_event // DAY_MS * DAY_MS, history_start) if first_event is not None else history_start, as_of_ms)
-        label_ready = labels["confirmed_threat_user_days"]["ready"] and labels["benign_user_days"]["ready"]
         statistical_training = history["ready"] and all(item["statistical"]["ready"] for item in windows.values())
         model_global = history["ready"] and all(item["model"]["ready"] for item in windows.values())
         statistical_peer = history["ready"] and any(all(group["windows"][str(size)]["statistical"]["ready"] for size in WINDOW_SIZES) for group in peer_groups)
         model_peer = history["ready"] and any(all(group["windows"][str(size)]["model"]["ready"] for size in WINDOW_SIZES) for group in peer_groups)
         detectors = {
-            "statistical": _detector_status(statistical_training, statistical_peer, label_ready),
-            "hbos": _detector_status(model_global, model_peer, label_ready),
-            "isolation_forest": _detector_status(model_global, model_peer, label_ready),
+            "statistical": _detector_status(statistical_training, statistical_peer),
+            "hbos": _detector_status(model_global, model_peer),
+            "isolation_forest": _detector_status(model_global, model_peer),
         }
-        actions = self._next_actions(history, windows, peer_groups, labels, detectors)
+        actions = self._next_actions(history, windows, peer_groups, detectors)
         return {
             "as_of": _iso(as_of_ms),
             "collection_window": {"from": _iso(history_start), "to": _iso(as_of_ms)},
             "history": history,
             "windows": windows,
             "peer_groups": peer_groups,
-            "labels": labels,
             "detectors": detectors,
             "next_actions": actions,
         }
@@ -181,35 +172,9 @@ class ReadinessEngine:
             })
         return result
 
-    def _label_readiness(self, start: int, end: int) -> dict[str, Any]:
-        disposition_counts = {"confirmed_threat": 0, "benign": 0, "unknown": 0}
-        rows = self.cases.execute(
-            "SELECT user_name,first_seen,last_seen,disposition FROM cases WHERE last_seen >= ? AND first_seen < ? ORDER BY user_name,first_seen",
-            (start, end),
-        ).fetchall()
-        labels: dict[tuple[str, int], str] = {}
-        for row in rows:
-            disposition = row["disposition"]
-            disposition_counts[disposition] = disposition_counts.get(disposition, 0) + 1
-            first_day = max(start, int(row["first_seen"]) // DAY_MS * DAY_MS)
-            last_day = min(end, int(row["last_seen"]) // DAY_MS * DAY_MS + DAY_MS)
-            for day in range(first_day, last_day, DAY_MS):
-                key, current = (row["user_name"], day), labels.get((row["user_name"], day))
-                if disposition == "confirmed_threat" or (disposition == "benign" and current != "confirmed_threat"):
-                    labels[key] = disposition
-        confirmed = sum(value == "confirmed_threat" for value in labels.values())
-        benign = sum(value == "benign" for value in labels.values())
-        return {
-            "case_count": len(rows),
-            "case_dispositions": disposition_counts,
-            "labeled_user_days": confirmed + benign,
-            "confirmed_threat_user_days": _target_progress(confirmed, self.targets.confirmed_threat_user_days),
-            "benign_user_days": _target_progress(benign, self.targets.benign_user_days),
-        }
-
     def _next_actions(
         self, history: dict[str, Any], windows: dict[str, Any], peer_groups: list[dict[str, Any]],
-        labels: dict[str, Any], detectors: dict[str, Any],
+        detectors: dict[str, Any],
     ) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         if history["missing_days"]:
@@ -217,12 +182,6 @@ class ReadinessEngine:
         for size, item in windows.items():
             if item["model"]["missing_samples"]:
                 actions.append({"priority": 2, "kind": "collect_windows", "window_size": int(size), "message": f"Collect {item['model']['missing_samples']} more global {size}s windows for model training."})
-        missing_positive = labels["confirmed_threat_user_days"]["missing"]
-        missing_benign = labels["benign_user_days"]["missing"]
-        if missing_positive:
-            actions.append({"priority": 1, "kind": "label_confirmed_threat", "message": f"Label {missing_positive} more confirmed-threat user-days."})
-        if missing_benign:
-            actions.append({"priority": 1, "kind": "label_benign", "message": f"Label {missing_benign} more benign user-days."})
         unassigned = [group for group in peer_groups if group["configured_member_count"] < self.model_config.min_peer_members]
         if unassigned:
             actions.append({"priority": 3, "kind": "expand_peer_groups", "groups": [group["group_id"] for group in unassigned], "message": "Add members or consolidate undersized peer groups."})
@@ -237,20 +196,14 @@ class ReadinessEngine:
     def _verify_inputs(self) -> None:
         feature_meta = _meta(self.feature, "feature_meta")
         baseline_meta = _meta(self.baseline, "baseline_meta")
-        case_meta = _meta(self.cases, "case_meta")
         if feature_meta.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
             raise ReadinessError("feature schema version changed; rebuild Feature DB")
         if baseline_meta.get("baseline_schema_version") != BASELINE_SCHEMA_VERSION:
             raise ReadinessError("baseline schema version changed; rebuild Baseline DB")
-        if case_meta.get("case_schema_version") != CASE_SCHEMA_VERSION:
-            raise ReadinessError("case schema version changed; rebuild Case DB")
         try:
             self.baseline_config = BaselineConfig(**json.loads(baseline_meta["baseline_config_json"]))
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ReadinessError("Baseline DB lacks a valid baseline_config_json") from exc
-        columns = {row[1] for row in self.cases.execute("PRAGMA table_info(cases)")}
-        if "disposition" not in columns:
-            raise ReadinessError("Case DB lacks disposition; upgrade Case DB before readiness reporting")
 
 
 def _empty_window_readiness(baseline: BaselineConfig, model: ModelDetectionConfig) -> dict[str, Any]:
@@ -261,17 +214,13 @@ def _empty_window_readiness(baseline: BaselineConfig, model: ModelDetectionConfi
     }
 
 
-def _target_progress(current: int, target: int) -> dict[str, Any]:
-    return {"current": current, "target": target, "missing": max(0, target - current), "ready": current >= target}
-
-
-def _detector_status(global_ready: bool, peer_ready: bool, labels_ready: bool) -> dict[str, Any]:
+def _detector_status(global_ready: bool, peer_ready: bool) -> dict[str, Any]:
     training_status = "ready" if global_ready else ("partial" if peer_ready else "not_ready")
     return {
         "training_status": training_status,
         "training_ready": training_status == "ready",
-        "evaluation_ready": training_status == "ready" and labels_ready,
-        "label_ready": labels_ready,
+        "evaluation_ready": training_status == "ready",
+        "evaluation_mode": "unsupervised",
     }
 
 

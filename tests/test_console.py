@@ -71,6 +71,7 @@ def test_job_store_persists_lifecycle_and_builds_allowlisted_command(tmp_path):
     assert store.get(job_id)["status"] == "succeeded"
     command = build_job_command(project, "readiness", {})
     assert command[-2:] == ["--report-output", str(tmp_path / "output/readiness-report.json")]
+    assert "--case-state" not in command
 
 
 def test_demo_console_renders_core_pages_and_is_read_only(tmp_path):
@@ -85,6 +86,10 @@ def test_demo_console_renders_core_pages_and_is_read_only(tmp_path):
     response = _request(app, "/jobs/readiness", "POST", {"csrf": app.csrf_token})
     assert response["status"] == "400 Bad Request"
     assert "demo mode is read-only" in response["body"]
+    experiments = _request(app, "/experiments")["body"]
+    assert "日波动 CV" in experiments and "Precision" not in experiments
+    readiness = _request(app, "/readiness")["body"]
+    assert "训练数据未就绪" in readiness and "Benign" not in readiness
 
 
 def _rule_form(token: str) -> dict[str, str]:

@@ -4,6 +4,8 @@
 
 当前阶段支持本地历史文件与 Kafka 实时消费，以及基于 `user.name` 的 Session + Feature v2 行为聚合。未知日志的 parser 候选生成可选调用真实 LLM，但不会出现在逐条日志解析路径中。
 
+**模型原则：** LogFusion 不采用监督学习，不采集或构造训练标签。检测路线固定为安全规则、统计基线、HBOS/Isolation Forest 等无监督模型，以及未来采用自监督训练的序列模型；Case 人工操作仅服务调查、处置和审计，不回流模型训练。
+
 ## 环境
 
 推荐使用已有 conda 环境 `agent`：
@@ -339,7 +341,7 @@ conda run -n agent python -m logfusion orchestrate run \
 
 默认 watermark 是已观察最大 `event.time` 减 5 分钟，可用 `--watermark-lag-seconds` 调整；它用于关闭稳定的实时会话。末尾尚未写完的一行不会提交，会留给下次追加后处理。输入必须是 append-only：恢复时如已提交前缀被改写、文件被替换、配置或任一 State DB 路径改变，编排器会拒绝继续。`--no-downstream` 仅更新 Feature DB，适合排障或分阶段运行。
 
-## Alert Lifecycle & Analyst Feedback v1
+## Alert Lifecycle & Operations v1
 
 Risk DB 只保存机器产生的版本化告警；Case DB 以稳定的 `alert_key` 保存人工处理状态，因此 Fusion 更新和旧告警 `superseded` 不会覆盖分析结论。先同步新的 active alert：
 
@@ -356,26 +358,18 @@ conda run -n agent python -m logfusion cases transition \
   --note '已开始核查会话与仓库访问'
 ```
 
-支持 `new`、`acknowledged`、`investigating`、`resolved`、`false_positive`、`suppressed` 状态，以及 `assign`、`comment`、`set-tags`。`suppressed` 必须指定未来的 `--suppression-until`；到期后下一次 `cases sync` 自动恢复为 `new`。所有操作都写入 Case DB 的审计事件。终态 Case 收到新的风险告警版本时保持原结论，但标记 `requires_review: true`，由分析员决定是否重新打开。
+支持 `new`、`acknowledged`、`investigating`、`resolved`、`false_positive`、`suppressed` 状态，以及 `assign`、`comment`、`set-tags`。`suppressed` 必须指定未来的 `--suppression-until`；到期后下一次 `cases sync` 自动恢复为 `new`。所有操作都写入 Case DB 的审计事件。终态 Case 收到新的风险告警版本时保持运营状态，但标记 `requires_review: true`，由分析员决定是否重新打开。Case 状态、评论和标签只用于调查、处置与审计，不作为模型训练样本或 Evaluation 真值。
 
-Case 的处置结论（`disposition`）与生命周期状态独立：`confirmed_threat` 是回测正样本、`benign` 是负样本、默认 `unknown` 不参与准确率。它不会改变 `status`，可通过以下命令记录并保留审计轨迹：
+## Unsupervised Detection Backtest & Evaluation v4
 
-```bash
-conda run -n agent python -m logfusion cases disposition \
-  --risk-state output/risk.db --state output/cases.db \
-  --case-id <case_id> --value confirmed_threat --actor alice
-```
-
-## Detection Backtest & Evaluation v3
-
-Evaluation 使用 Feature、Baseline 和 Case DB 的只读快照，不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线或训练模型，因此当天及未来行为不会泄露到参照分布中。Evaluation DB v3 不兼容旧版本；旧实验应从当前 Feature/Baseline/Case 状态重跑。
+Evaluation 只读取 Feature 和 Baseline DB，不读取 Case，也不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线或训练模型，因此当天及未来行为不会泄露到参照分布中。Evaluation DB v4 不兼容旧版本；旧实验应从当前 Feature/Baseline 状态重跑。
 
 `statistical` 复用 Detection Policy 的 P95/P99、低频/首次值、source type 覆盖和 personal → peer group → global 回退。`hbos` 与 `isolation_forest` 使用相同的 13 维派生窗口特征，只在至少 5 名活跃成员、100 个真实窗口的 peer group 上训练，否则回退至少 100 个真实窗口的 global 模型。模型训练仍包含被评估用户自身的历史窗口，不做 leave-one-out。
 
 ```bash
 conda run -n agent python -m logfusion evaluate run \
   --feature-state output/features.db --baseline-state output/baseline.db \
-  --case-state output/cases.db --state output/evaluation.db \
+  --state output/evaluation.db \
   --detector statistical --policy-config config/detection.local.yaml \
   --name statistical-v2 \
   --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z \
@@ -383,14 +377,14 @@ conda run -n agent python -m logfusion evaluate run \
 
 conda run -n agent python -m logfusion evaluate run \
   --feature-state output/features.db --baseline-state output/baseline.db \
-  --case-state output/cases.db --state output/evaluation.db \
+  --state output/evaluation.db \
   --detector hbos --model-config config/model-detection.local.yaml \
   --name hbos-v1 \
   --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z
 
 conda run -n agent python -m logfusion evaluate run \
   --feature-state output/features.db --baseline-state output/baseline.db \
-  --case-state output/cases.db --state output/evaluation.db \
+  --state output/evaluation.db \
   --detector isolation_forest --model-config config/model-detection.local.yaml \
   --name isolation-forest-v1 \
   --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z
@@ -419,17 +413,16 @@ model_detection:
 
 HBOS 对每个特征建立等频直方图并保存贡献最大的三个特征。Isolation Forest 使用固定随机种子和 200 棵树；其 explanation 中的 robust deviation 只是调查辅助证据，不代表模型特征归因。两种模型都使用训练异常分的 P99.5 作为阈值，并保存每日训练范围、scope、样本数、原始分和 percentile，不持久化 sklearn 模型。
 
-评估单位是 `user.name + UTC day`：当天所有 candidate 合并为最大分数、candidate 数量、detector、严重度和基线范围。与该用户日相交的 Case 作为标签；同日多个标签以 `confirmed_threat` 优先，其次是 `benign`，仅有 `unknown` 时不计标签。指标只在已标注样本上计算 TP、FP、FN、precision、recall 和 F1；不计算 TN 或 accuracy。未标注预测、candidate 数、预测用户日数和平均每日预测量单独统计，**未标注预测不等于误报**。比较时优先关注 precision 与每日预测量，不会自动把任一模型接入生产链路。
+评估单位是 `user.name + UTC day`：当天所有 candidate 合并为最大分数、candidate 数量、detector、严重度和基线范围。系统不构造标签，也不计算 TP、FP、FN、precision、recall、F1 或 accuracy。实验指标包括 candidate 数、预测用户日、异常用户数、活跃预测日、平均每日 candidate/预测用户日、日预测最小值/最大值/标准差/CV、高严重度 candidate 和最高分。`evaluate compare` 还返回两个实验预测用户日的交集、并集和 Jaccard 重合度；这些指标用于控制告警量、覆盖面和稳定性，不代表检测准确率，也不会自动把任一模型接入生产链路。
 
 ### 数据准备度与采集闭环
 
-在训练或比较模型前，使用只读 readiness 报告检查当前数据缺口；该命令不会创建 Evaluation DB，也不会修改 Feature、Baseline 或 Case：
+在训练或比较模型前，使用只读 readiness 报告检查当前数据缺口；该命令只读取 Feature 和 Baseline，不会创建 Evaluation DB 或修改任何状态：
 
 ```bash
 conda run -n agent python -m logfusion evaluate readiness \
   --feature-state output/features.db \
   --baseline-state output/baseline.db \
-  --case-state output/cases.db \
   --model-config config/model-detection.local.yaml \
   --report-output output/readiness-report.json
 ```
@@ -438,15 +431,14 @@ conda run -n agent python -m logfusion evaluate readiness \
 
 - 全局 1h/1d 窗口的样本、活跃用户和活跃日数量。
 - 每个 Peer Group 的配置成员、活跃成员及统计/模型训练缺口。
-- `confirmed_threat`、`benign`、`unknown` Case 数和用户日标签；同一用户日仍以 confirmed threat 优先。
 - statistical、HBOS、Isolation Forest 各自的 `training_status` 与 `evaluation_ready`。
-- 按优先级排序的下一步动作，例如继续采集历史、补窗口、标注 Case 或扩充群体。
+- 按优先级排序的下一步动作，例如继续采集历史、补窗口或扩充群体。
 
-默认采集里程碑是 30 天历史、30 个 confirmed-threat 用户日和 100 个 benign 用户日。`training_ready` 只表示窗口样本足够拟合；只有历史和两类标签同时达标才会标记 `evaluation_ready`。采集期间继续运行统计检测与 Case sync，并由分析员使用 `cases disposition` 写入真实结论；不要把未标注预测自动当成 benign。
+默认采集里程碑是连续 30 天历史，并满足 Statistical、HBOS 和 Isolation Forest 各自的真实窗口样本要求。`evaluation_ready` 与训练数据准备度一致，不依赖 Case 或人工结论。规则条件中的正反测试对象只用于验证规则逻辑，不进入任何模型训练过程。
 
 ## 本次状态升级与重建
 
-本里程碑的 Feature v2、Baseline v3、Detection v3、Incident v2、Risk v2、Case v2 和 Evaluation v3 不读取旧状态。遇到旧 schema 会明确报错，不会静默升级或混用历史语义。建议先备份旧 `output/*.db`，再使用新路径按以下顺序重建：
+本里程碑的 Feature v2、Baseline v3、Detection v3、Incident v2、Risk v2、Case v3 和 Evaluation v4 不读取旧状态。遇到旧 schema 会明确报错，不会静默升级或混用历史语义。建议先备份旧 `output/*.db`，再使用新路径按以下顺序重建：
 
 ```text
 Raw / normalized + Parser Registry + rules JSON（保留）
@@ -631,7 +623,7 @@ conda run -n agent python -m logfusion quality drift \
 | `detect run` | Feature DB + Baseline DB + 可选规则 → 统一 Candidate/Evidence DB |
 | `detect query` | 查询用户时间范围内相交的 active 异常候选 |
 | `evaluate run/query/compare` | 对统计、HBOS、Isolation Forest 做 point-in-time 用户日回测与实验比较 |
-| `evaluate readiness` | 只读检查历史、窗口、Peer Group 和 disposition 标签的采集缺口 |
+| `evaluate readiness` | 只读检查历史、窗口和 Peer Group 的无监督训练数据缺口 |
 | `correlate run` | Active anomaly candidates → 版本化跨系统 Incident DB |
 | `correlate query` | 查询用户时间范围内相交的 active Incident |
 | `fuse run` | Detection DB + Incident DB → 风险评估与策略控制后的告警 DB |
@@ -692,8 +684,8 @@ LogFusion/
 | `baseline.py` | SQLite BaselineEngine、个人/全局统计与值频次基线 |
 | `detection.py` | SQLite DetectionEngine、统计异常候选与 revision 替代 |
 | `model_detection.py` | Evaluation 专用派生特征、HBOS 与可选 Isolation Forest 检测器 |
-| `evaluation.py` | Point-in-time 基线/模型训练、用户日标签与实验指标持久化 |
-| `readiness.py` | Feature/Baseline/Case 数据准备度、标签里程碑与采集动作报告 |
+| `evaluation.py` | Point-in-time 无监督基线/模型训练、预测量与稳定性指标持久化 |
+| `readiness.py` | Feature/Baseline 无监督训练数据准备度与采集动作报告 |
 | `rules.py` | 规则 DSL、运算符、测试门禁、版本与原子化生命周期管理 |
 | `correlation.py` | SQLite CorrelationEngine、session/时间桶关联与 Incident 聚合 |
 | `fusion.py` | SQLite FusionEngine、风险评分、告警门槛、预算抑制与版本替代 |

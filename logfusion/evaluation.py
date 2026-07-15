@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from logfusion.baseline import BASELINE_SCHEMA_VERSION, BaselineConfig, METRICS, _active_days, _personal_metric_values, _statistics
-from logfusion.cases import CASE_SCHEMA_VERSION
 from logfusion.detection import DetectionConfig, FEATURE_SCHEMA_VERSION, WINDOW_SIZES
 from logfusion.model_detection import (
     MODEL_DETECTORS,
@@ -21,7 +21,7 @@ from logfusion.model_detection import (
 )
 
 
-EVALUATION_SCHEMA_VERSION = "3"
+EVALUATION_SCHEMA_VERSION = "4"
 EVALUATION_DETECTORS = ("statistical", *MODEL_DETECTORS)
 
 
@@ -30,21 +30,20 @@ class EvaluationError(ValueError):
 
 
 class EvaluationEngine:
-    """Point-in-time backtesting for statistical and model-based detectors."""
+    """Unlabeled point-in-time backtesting for statistical and unsupervised detectors."""
 
     def __init__(
         self,
         feature_state: Path | str,
         baseline_state: Path | str,
-        case_state: Path | str,
         evaluation_state: Path | str,
         detection_config: DetectionConfig | None = None,
         detector_id: str = "statistical",
         model_config: ModelDetectionConfig | None = None,
     ) -> None:
-        self.feature_path, self.baseline_path, self.case_path = map(Path, (feature_state, baseline_state, case_state))
-        if not all(path.exists() for path in (self.feature_path, self.baseline_path, self.case_path)):
-            raise EvaluationError("feature state, baseline state, and case state must exist")
+        self.feature_path, self.baseline_path = map(Path, (feature_state, baseline_state))
+        if not all(path.exists() for path in (self.feature_path, self.baseline_path)):
+            raise EvaluationError("feature state and baseline state must exist")
         if detector_id not in EVALUATION_DETECTORS:
             raise EvaluationError(f"unsupported evaluation detector: {detector_id}")
         self.evaluation_path = Path(evaluation_state)
@@ -59,7 +58,6 @@ class EvaluationEngine:
             raise EvaluationError(str(exc)) from exc
         self.feature = _readonly(self.feature_path)
         self.baseline = _readonly(self.baseline_path)
-        self.cases = _readonly(self.case_path)
         self.connection = sqlite3.connect(self.evaluation_path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -75,7 +73,6 @@ class EvaluationEngine:
     def close(self) -> None:
         self.feature.close()
         self.baseline.close()
-        self.cases.close()
         self.connection.close()
 
     def __enter__(self) -> "EvaluationEngine":
@@ -107,9 +104,8 @@ class EvaluationEngine:
                 day_predictions, day_snapshots = self._detect_model_day(day_start, day_end)
                 predictions.extend(day_predictions)
                 model_snapshots.extend((experiment_id, *row) for row in day_snapshots)
-        labels = self._labels(start_ms, end_ms)
         return self._persist(
-            experiment_id, name, start_ms, end_ms, baseline_snapshots, model_snapshots, predictions, labels,
+            experiment_id, name, start_ms, end_ms, baseline_snapshots, model_snapshots, predictions,
         )
 
     def query(self, experiment_id: str) -> dict[str, Any]:
@@ -338,31 +334,15 @@ class EvaluationEngine:
             "raw_score": None, "score_percentile": None, "explanation": explanation,
         }
 
-    def _labels(self, start: int, end: int) -> dict[tuple[str, int], str]:
-        result: dict[tuple[str, int], str] = {}
-        rows = self.cases.execute(
-            "SELECT user_name,first_seen,last_seen,disposition FROM cases WHERE last_seen >= ? AND first_seen < ?",
-            (start, end),
-        ).fetchall()
-        for row in rows:
-            first_day = max(start, int(row["first_seen"]) // 86_400_000 * 86_400_000)
-            last_day = min(end, int(row["last_seen"]) // 86_400_000 * 86_400_000 + 86_400_000)
-            for day in range(first_day, last_day, 86_400_000):
-                key, current = (row["user_name"], day), result.get((row["user_name"], day))
-                if row["disposition"] == "confirmed_threat" or (row["disposition"] == "benign" and current != "confirmed_threat"):
-                    result[key] = row["disposition"]
-        return result
-
     def _persist(
         self, experiment_id: str, name: str, start: int, end: int,
         baseline_snapshots: list[tuple[Any, ...]], model_snapshots: list[tuple[Any, ...]],
-        candidates: list[dict[str, Any]], labels: dict[tuple[str, int], str],
+        candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
         by_day: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for candidate in candidates:
             by_day.setdefault((candidate["user_name"], candidate["day_start"]), []).append(candidate)
-        keys = sorted(set(by_day) | set(labels))
-        tp = fp = fn = unlabeled = 0
+        keys = sorted(by_day)
         day_count = (end - start) // 86_400_000
         config_json = self._detector_config_json()
         config_fingerprint = self._detector_config_fingerprint()
@@ -386,37 +366,38 @@ class EvaluationEngine:
                     (experiment_id, *[candidate[field] for field in fields], json.dumps(candidate["explanation"], sort_keys=True)),
                 )
             for user, day in keys:
-                predicted, label = by_day.get((user, day), []), labels.get((user, day))
+                predicted = by_day[(user, day)]
                 max_score = max((item["score"] for item in predicted), default=None)
                 self.connection.execute(
                     "INSERT INTO user_day_predictions(experiment_id,user_name,day_start,max_score,candidate_count,detectors_json,severities_json,baseline_scopes_json) VALUES (?,?,?,?,?,?,?,?)",
                     (experiment_id, user, day, max_score, len(predicted), json.dumps(sorted({item["detector_id"] for item in predicted})), json.dumps(sorted({item["severity"] for item in predicted})), json.dumps(sorted({item["baseline_scope"] for item in predicted}))),
                 )
-                if label:
-                    self.connection.execute("INSERT INTO user_day_labels(experiment_id,user_name,day_start,disposition) VALUES (?,?,?,?)", (experiment_id, user, day, label))
-                if label == "confirmed_threat":
-                    if predicted:
-                        tp += 1
-                    else:
-                        fn += 1
-                elif label == "benign" and predicted:
-                    fp += 1
-                elif predicted:
-                    unlabeled += 1
-            precision = tp / (tp + fp) if tp + fp else 0.0
-            recall = tp / (tp + fn) if tp + fn else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
             predicted_user_days = len(by_day)
-            metrics = (tp, fp, fn, precision, recall, f1, unlabeled, len(candidates), predicted_user_days, predicted_user_days / day_count)
+            unique_users = len({user for user, _ in by_day})
+            daily_predictions = [sum(day == current for _, day in by_day) for current in range(start, end, 86_400_000)]
+            daily_candidates = [sum(1 for item in candidates if item["day_start"] == current) for current in range(start, end, 86_400_000)]
+            average_daily_predictions = predicted_user_days / day_count
+            average_daily_candidates = len(candidates) / day_count
+            variance = sum((value - average_daily_predictions) ** 2 for value in daily_predictions) / day_count
+            daily_prediction_stddev = math.sqrt(variance)
+            daily_prediction_cv = daily_prediction_stddev / average_daily_predictions if average_daily_predictions else 0.0
+            metrics = (
+                len(candidates), predicted_user_days, unique_users,
+                sum(value > 0 for value in daily_predictions), average_daily_predictions, average_daily_candidates,
+                min(daily_predictions, default=0), max(daily_predictions, default=0),
+                daily_prediction_stddev, daily_prediction_cv,
+                sum(item["severity"] == "high" for item in candidates), max((item["score"] for item in candidates), default=0),
+                min(daily_candidates, default=0), max(daily_candidates, default=0),
+            )
             self.connection.execute(
-                "INSERT INTO experiment_metrics(experiment_id,true_positive,false_positive,false_negative,precision,recall,f1,unlabeled_predictions,candidate_count,predicted_user_days,average_daily_predictions) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO experiment_metrics(experiment_id,candidate_count,predicted_user_days,unique_predicted_users,active_prediction_days,average_daily_predictions,average_daily_candidates,min_daily_predictions,max_daily_predictions,daily_prediction_stddev,daily_prediction_cv,high_severity_candidates,max_candidate_score,min_daily_candidates,max_daily_candidates) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (experiment_id, *metrics),
             )
         return self.query(experiment_id)
 
     def _verify_inputs(self) -> None:
-        feature, baseline, case = _meta(self.feature, "feature_meta"), _meta(self.baseline, "baseline_meta"), _meta(self.cases, "case_meta")
-        if feature.get("feature_schema_version") != FEATURE_SCHEMA_VERSION or baseline.get("baseline_schema_version") != BASELINE_SCHEMA_VERSION or case.get("case_schema_version") != CASE_SCHEMA_VERSION:
+        feature, baseline = _meta(self.feature, "feature_meta"), _meta(self.baseline, "baseline_meta")
+        if feature.get("feature_schema_version") != FEATURE_SCHEMA_VERSION or baseline.get("baseline_schema_version") != BASELINE_SCHEMA_VERSION:
             raise EvaluationError("input state schema changed; rebuild the affected state")
         config_json = baseline.get("baseline_config_json")
         if not config_json:
@@ -438,8 +419,7 @@ class EvaluationEngine:
         CREATE TABLE IF NOT EXISTS daily_model_snapshots (experiment_id TEXT NOT NULL,day_start INTEGER NOT NULL,window_size INTEGER NOT NULL,scope TEXT NOT NULL,subject TEXT NOT NULL,status TEXT NOT NULL,sample_count INTEGER NOT NULL,member_count INTEGER NOT NULL,history_start INTEGER NOT NULL,history_end INTEGER NOT NULL,threshold REAL,threshold_quantile REAL NOT NULL,config_json TEXT NOT NULL,dependency_versions_json TEXT NOT NULL,PRIMARY KEY(experiment_id,day_start,window_size,scope,subject));
         CREATE TABLE IF NOT EXISTS candidate_predictions (experiment_id TEXT NOT NULL,user_name TEXT NOT NULL,day_start INTEGER NOT NULL,window_start INTEGER NOT NULL,window_end INTEGER NOT NULL,detector_id TEXT NOT NULL,score INTEGER NOT NULL,severity TEXT NOT NULL,baseline_scope TEXT NOT NULL,baseline_group_id TEXT,value_type TEXT,value_key TEXT,raw_score REAL,score_percentile REAL,explanation_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS user_day_predictions (experiment_id TEXT NOT NULL,user_name TEXT NOT NULL,day_start INTEGER NOT NULL,max_score INTEGER,candidate_count INTEGER NOT NULL,detectors_json TEXT NOT NULL,severities_json TEXT NOT NULL,baseline_scopes_json TEXT NOT NULL,PRIMARY KEY(experiment_id,user_name,day_start));
-        CREATE TABLE IF NOT EXISTS user_day_labels (experiment_id TEXT NOT NULL,user_name TEXT NOT NULL,day_start INTEGER NOT NULL,disposition TEXT NOT NULL,PRIMARY KEY(experiment_id,user_name,day_start));
-        CREATE TABLE IF NOT EXISTS experiment_metrics (experiment_id TEXT PRIMARY KEY,true_positive INTEGER NOT NULL,false_positive INTEGER NOT NULL,false_negative INTEGER NOT NULL,precision REAL NOT NULL,recall REAL NOT NULL,f1 REAL NOT NULL,unlabeled_predictions INTEGER NOT NULL,candidate_count INTEGER NOT NULL,predicted_user_days INTEGER NOT NULL,average_daily_predictions REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS experiment_metrics (experiment_id TEXT PRIMARY KEY,candidate_count INTEGER NOT NULL,predicted_user_days INTEGER NOT NULL,unique_predicted_users INTEGER NOT NULL,active_prediction_days INTEGER NOT NULL,average_daily_predictions REAL NOT NULL,average_daily_candidates REAL NOT NULL,min_daily_predictions INTEGER NOT NULL,max_daily_predictions INTEGER NOT NULL,daily_prediction_stddev REAL NOT NULL,daily_prediction_cv REAL NOT NULL,high_severity_candidates INTEGER NOT NULL,max_candidate_score INTEGER NOT NULL,min_daily_candidates INTEGER NOT NULL,max_daily_candidates INTEGER NOT NULL);
         """)
         self.connection.commit()
 
@@ -461,7 +441,7 @@ class EvaluationEngine:
         payload = {
             "feature": self.feature_meta.get("config_fingerprint"), "feature_revision": self.feature_meta.get("current_revision"),
             "baseline": self.baseline_meta.get("baseline_config_fingerprint"), "peer_groups": self.baseline_meta.get("peer_groups_fingerprint"),
-            "detector": self.detector_id, "detector_config": self._detector_config_fingerprint(), "cases": _case_fingerprint(self.cases),
+            "detector": self.detector_id, "detector_config": self._detector_config_fingerprint(),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -525,10 +505,25 @@ def _query_connection(connection: sqlite3.Connection, experiment_id: str) -> dic
 def _compare_connection(connection: sqlite3.Connection, left_id: str, right_id: str) -> dict[str, Any]:
     left, right = _query_connection(connection, left_id), _query_connection(connection, right_id)
     fields = (
-        "true_positive", "false_positive", "false_negative", "precision", "recall", "f1",
-        "unlabeled_predictions", "candidate_count", "predicted_user_days", "average_daily_predictions",
+        "candidate_count", "predicted_user_days", "unique_predicted_users", "active_prediction_days",
+        "average_daily_predictions", "average_daily_candidates", "min_daily_predictions", "max_daily_predictions",
+        "daily_prediction_stddev", "daily_prediction_cv", "high_severity_candidates", "max_candidate_score",
+        "min_daily_candidates", "max_daily_candidates",
     )
-    return {"left": left, "right": right, "delta": {field: right["metrics"].get(field, 0) - left["metrics"].get(field, 0) for field in fields}}
+    left_days = {(row[0], row[1]) for row in connection.execute("SELECT user_name,day_start FROM user_day_predictions WHERE experiment_id = ? AND candidate_count > 0", (left_id,))}
+    right_days = {(row[0], row[1]) for row in connection.execute("SELECT user_name,day_start FROM user_day_predictions WHERE experiment_id = ? AND candidate_count > 0", (right_id,))}
+    union = left_days | right_days
+    intersection = left_days & right_days
+    return {
+        "left": left,
+        "right": right,
+        "delta": {field: right["metrics"].get(field, 0) - left["metrics"].get(field, 0) for field in fields},
+        "overlap": {
+            "left_user_days": len(left_days), "right_user_days": len(right_days),
+            "intersection_user_days": len(intersection), "union_user_days": len(union),
+            "jaccard": len(intersection) / len(union) if union else 1.0,
+        },
+    }
 
 
 def _readonly(path: Path) -> sqlite3.Connection:
@@ -547,11 +542,6 @@ def _existing_evaluation_version(connection: sqlite3.Connection) -> str | None:
         return None
     row = connection.execute("SELECT value FROM evaluation_meta WHERE key='evaluation_schema_version'").fetchone()
     return row[0] if row else None
-
-
-def _case_fingerprint(connection: sqlite3.Connection) -> str:
-    rows = [tuple(row) for row in connection.execute("SELECT case_id,user_name,first_seen,last_seen,disposition,updated_at FROM cases ORDER BY case_id")]
-    return hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
 
 
 def _utc_day(value: str | int | datetime) -> int:

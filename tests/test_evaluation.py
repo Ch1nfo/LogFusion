@@ -15,52 +15,42 @@ from tests.test_detection import _event
 from tests.test_detection import _seed_ready
 
 
-def _case_state(path, *, disposition: str = "confirmed_threat", user: str = "wangkun78", first_seen: int = 1768953600000, last_seen: int = 1769039999999) -> None:
-    connection = sqlite3.connect(path)
-    connection.executescript("""
-    CREATE TABLE case_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE cases (case_id TEXT PRIMARY KEY, alert_key TEXT, current_alert_id TEXT, user_name TEXT NOT NULL, incident_id TEXT,
-      first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, risk_score INTEGER, severity TEXT, status TEXT, owner TEXT,
-      tags_json TEXT, suppression_until INTEGER, requires_review INTEGER, source_correlation_revision INTEGER, disposition TEXT NOT NULL,
-      created_at INTEGER, updated_at INTEGER NOT NULL);
-    """)
-    connection.execute("INSERT INTO case_meta(key,value) VALUES ('case_schema_version','2')")
-    connection.execute("INSERT INTO cases(case_id,user_name,first_seen,last_seen,disposition,updated_at) VALUES ('case-1',?,?,?,?,0)", (user, first_seen, last_seen, disposition))
-    connection.commit()
-    connection.close()
-
-
 def test_evaluation_builds_point_in_time_snapshots_and_is_idempotent(tmp_path):
-    feature_db, baseline_db, case_db, evaluation_db = (tmp_path / name for name in ("features.db", "baseline.db", "cases.db", "evaluation.db"))
+    feature_db, baseline_db, evaluation_db = (tmp_path / name for name in ("features.db", "baseline.db", "evaluation.db"))
     as_of = _seed_ready(feature_db, include_outlier=True)
     with BaselineEngine(feature_db, baseline_db) as baseline:
         baseline.update(as_of)
-    _case_state(case_db)
-
-    with EvaluationEngine(feature_db, baseline_db, case_db, evaluation_db) as engine:
+    with EvaluationEngine(feature_db, baseline_db, evaluation_db) as engine:
         report = engine.run("policy-v2", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
         repeated = engine.run("policy-v2", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
         assert report["experiment_id"] == repeated["experiment_id"]
-        assert report["metrics"]["true_positive"] == 1
-        assert engine.compare(report["experiment_id"], report["experiment_id"])["delta"]["f1"] == 0
+        assert report["metrics"]["candidate_count"] > 0
+        comparison = engine.compare(report["experiment_id"], report["experiment_id"])
+        assert comparison["delta"]["daily_prediction_cv"] == 0
+        assert comparison["overlap"]["jaccard"] == 1.0
     connection = sqlite3.connect(evaluation_db)
     assert connection.execute("SELECT COUNT(*) FROM daily_baseline_snapshots").fetchone()[0] > 0
     assert connection.execute("SELECT COUNT(*) FROM candidate_predictions").fetchone()[0] > 0
     connection.close()
 
 
-def test_evaluation_requires_utc_day_boundaries_and_ignores_unknown_labels(tmp_path):
-    feature_db, baseline_db, case_db, evaluation_db = (tmp_path / name for name in ("features.db", "baseline.db", "cases.db", "evaluation.db"))
+def test_evaluation_requires_utc_day_boundaries_and_persists_unsupervised_metrics(tmp_path):
+    feature_db, baseline_db, evaluation_db = (tmp_path / name for name in ("features.db", "baseline.db", "evaluation.db"))
     as_of = _seed_ready(feature_db, include_outlier=True)
     with BaselineEngine(feature_db, baseline_db) as baseline:
         baseline.update(as_of)
-    _case_state(case_db, disposition="unknown")
-    with EvaluationEngine(feature_db, baseline_db, case_db, evaluation_db) as engine:
+    with EvaluationEngine(feature_db, baseline_db, evaluation_db) as engine:
         with pytest.raises(EvaluationError, match="UTC natural-day"):
             engine.run("bad", "2026-01-21T01:00:00Z", "2026-01-22T00:00:00Z")
         report = engine.run("unknown", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
-    assert report["metrics"]["unlabeled_predictions"] == 1
-    assert report["metrics"]["false_positive"] == 0
+    assert report["metrics"]["predicted_user_days"] == 1
+    assert report["metrics"]["unique_predicted_users"] == 1
+    assert report["metrics"]["daily_prediction_cv"] == 0
+    connection = sqlite3.connect(evaluation_db)
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "user_day_labels" not in tables
+    assert "precision" not in {row[1] for row in connection.execute("PRAGMA table_info(experiment_metrics)")}
+    connection.close()
 
 
 def _seed_model_history(tmp_path, *, peer_members: int = 5):
@@ -95,12 +85,11 @@ def _seed_model_history(tmp_path, *, peer_members: int = 5):
 @pytest.mark.parametrize("detector_id", ["hbos", "isolation_forest"])
 def test_model_evaluation_uses_prior_history_and_persists_evidence(tmp_path, detector_id):
     feature_db, baseline_db, user, day_start = _seed_model_history(tmp_path)
-    case_db, evaluation_db = tmp_path / "cases.db", tmp_path / "evaluation.db"
-    _case_state(case_db, user=user, first_seen=day_start, last_seen=day_start + 86_399_999)
-    with EvaluationEngine(feature_db, baseline_db, case_db, evaluation_db, detector_id=detector_id) as engine:
+    evaluation_db = tmp_path / "evaluation.db"
+    with EvaluationEngine(feature_db, baseline_db, evaluation_db, detector_id=detector_id) as engine:
         report = engine.run(detector_id, day_start, day_start + 86_400_000)
     assert report["detector_id"] == detector_id
-    assert report["metrics"]["true_positive"] == 1
+    assert report["metrics"]["predicted_user_days"] == 1
     connection = sqlite3.connect(evaluation_db)
     connection.row_factory = sqlite3.Row
     snapshots = connection.execute("SELECT * FROM daily_model_snapshots ORDER BY window_size").fetchall()
@@ -115,20 +104,18 @@ def test_model_evaluation_uses_prior_history_and_persists_evidence(tmp_path, det
 
 def test_model_falls_back_to_global_and_records_not_ready(tmp_path):
     feature_db, baseline_db, user, day_start = _seed_model_history(tmp_path, peer_members=4)
-    case_db, evaluation_db = tmp_path / "cases.db", tmp_path / "evaluation.db"
-    _case_state(case_db, user=user, first_seen=day_start, last_seen=day_start + 86_399_999)
-    with EvaluationEngine(feature_db, baseline_db, case_db, evaluation_db, detector_id="hbos") as engine:
+    evaluation_db = tmp_path / "evaluation.db"
+    with EvaluationEngine(feature_db, baseline_db, evaluation_db, detector_id="hbos") as engine:
         engine.run("global", day_start, day_start + 86_400_000)
     connection = sqlite3.connect(evaluation_db)
     assert {row[0] for row in connection.execute("SELECT DISTINCT scope FROM daily_model_snapshots")} == {"global"}
     connection.close()
 
-    small_feature, small_baseline, small_case, small_eval = (tmp_path / name for name in ("small-features.db", "small-baseline.db", "small-cases.db", "small-eval.db"))
+    small_feature, small_baseline, small_eval = (tmp_path / name for name in ("small-features.db", "small-baseline.db", "small-eval.db"))
     as_of = _seed_ready(small_feature, include_outlier=True)
     with BaselineEngine(small_feature, small_baseline) as baseline:
         baseline.update(as_of)
-    _case_state(small_case)
-    with EvaluationEngine(small_feature, small_baseline, small_case, small_eval, detector_id="hbos") as engine:
+    with EvaluationEngine(small_feature, small_baseline, small_eval, detector_id="hbos") as engine:
         report = engine.run("not-ready", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
     assert report["metrics"]["candidate_count"] == 0
     connection = sqlite3.connect(small_eval)
@@ -137,14 +124,13 @@ def test_model_falls_back_to_global_and_records_not_ready(tmp_path):
 
 
 def test_model_config_changes_experiment_id_and_v1_db_is_rejected(tmp_path):
-    feature_db, baseline_db, case_db = tmp_path / "features.db", tmp_path / "baseline.db", tmp_path / "cases.db"
+    feature_db, baseline_db = tmp_path / "features.db", tmp_path / "baseline.db"
     as_of = _seed_ready(feature_db, include_outlier=True)
     with BaselineEngine(feature_db, baseline_db) as baseline:
         baseline.update(as_of)
-    _case_state(case_db)
-    with EvaluationEngine(feature_db, baseline_db, case_db, tmp_path / "left.db", detector_id="hbos", model_config=ModelDetectionConfig(threshold_quantile=0.99)) as engine:
+    with EvaluationEngine(feature_db, baseline_db, tmp_path / "left.db", detector_id="hbos", model_config=ModelDetectionConfig(threshold_quantile=0.99)) as engine:
         left = engine.run("same", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
-    with EvaluationEngine(feature_db, baseline_db, case_db, tmp_path / "right.db", detector_id="hbos") as engine:
+    with EvaluationEngine(feature_db, baseline_db, tmp_path / "right.db", detector_id="hbos") as engine:
         right = engine.run("same", "2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z")
     assert left["experiment_id"] != right["experiment_id"]
 
@@ -155,4 +141,4 @@ def test_model_config_changes_experiment_id_and_v1_db_is_rejected(tmp_path):
     connection.commit()
     connection.close()
     with pytest.raises(EvaluationError, match="rebuild Evaluation DB"):
-        EvaluationEngine(feature_db, baseline_db, case_db, legacy)
+        EvaluationEngine(feature_db, baseline_db, legacy)
