@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-FUSION_SCHEMA_VERSION = "1"
-CORRELATION_SCHEMA_VERSION = "1"
-DETECTION_SCHEMA_VERSION = "2"
+FUSION_SCHEMA_VERSION = "2"
+CORRELATION_SCHEMA_VERSION = "2"
+DETECTION_SCHEMA_VERSION = "3"
 
 
 class FusionError(ValueError):
@@ -24,8 +24,8 @@ class FusionConfig:
     alert_threshold: int = 80
     critical_threshold: int = 90
     cross_system_bonus: int = 10
-    detector_bonus: int = 3
-    detector_bonus_cap: int = 10
+    detector_family_bonus: int = 3
+    detector_family_bonus_cap: int = 10
     per_user_daily_alert_limit: int = 3
     case_suppression_enabled: bool = True
 
@@ -81,7 +81,7 @@ class FusionEngine:
         self.close()
 
     def run(self, refresh_policy: bool = False) -> dict[str, Any]:
-        detection_revision = int(_meta_map(self.detection, "detection_meta").get("last_consumed_feature_revision", "0"))
+        detection_revision = int(_meta_map(self.detection, "detection_meta").get("current_detection_revision", "0"))
         correlation_revision = int(_meta_map(self.incidents, "correlation_meta").get("last_consumed_detection_revision", "0"))
         if correlation_revision != detection_revision:
             raise FusionError("Incident DB is behind Detection DB; run correlate run first")
@@ -186,8 +186,8 @@ class FusionEngine:
         source_types = json.loads(incident["source_types_json"])
         base = int(incident["aggregation_score"])
         cross_bonus = self.config.cross_system_bonus if len(source_types) > 1 else 0
-        detector_bonus = min(self.config.detector_bonus_cap, self.config.detector_bonus * max(0, int(incident["detector_count"]) - 1))
-        score = min(100, base + cross_bonus + detector_bonus)
+        family_bonus = min(self.config.detector_family_bonus_cap, self.config.detector_family_bonus * max(0, int(incident["detector_family_count"]) - 1))
+        score = min(100, base + cross_bonus + family_bonus)
         key = hashlib.sha256(incident["incident_key"].encode("utf-8")).hexdigest()
         assessment_id = hashlib.sha256(f"{key}:{revision}".encode("utf-8")).hexdigest()
         return {
@@ -205,9 +205,10 @@ class FusionEngine:
             "risk_breakdown": {
                 "incident_aggregation_score": base,
                 "cross_system_bonus": cross_bonus,
-                "detector_diversity_bonus": detector_bonus,
+                "detector_family_diversity_bonus": family_bonus,
                 "source_type_count": len(source_types),
                 "detector_count": int(incident["detector_count"]),
+                "detector_family_count": int(incident["detector_family_count"]),
             },
             "source_correlation_revision": revision,
         }
@@ -369,6 +370,8 @@ def query_risk_state(risk_state: Path | str, user_name: str, start: str | int | 
     connection = _readonly(path)
     try:
         meta = _meta_map(connection, "fusion_meta")
+        if meta.get("fusion_schema_version") != FUSION_SCHEMA_VERSION:
+            raise FusionError("fusion schema version changed; rebuild Risk DB")
         start_ms, end_ms = _timestamp_ms(start), _timestamp_ms(end)
         assessments = connection.execute(
             "SELECT * FROM risk_assessments WHERE user_name = ? AND status = 'active' AND first_seen < ? AND last_seen > ? ORDER BY risk_score DESC, first_seen DESC",

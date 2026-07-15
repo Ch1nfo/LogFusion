@@ -63,4 +63,7 @@ Thumbs.db
 
 # Local overrides
 config/*.local.yaml
+config/*.local.json
 config/local*.yaml
+.logfusion/jobs.db*
+.logfusion/demo.json

@@ -21,7 +21,7 @@ from logfusion.model_detection import (
 )
 
 
-EVALUATION_SCHEMA_VERSION = "2"
+EVALUATION_SCHEMA_VERSION = "3"
 EVALUATION_DETECTORS = ("statistical", *MODEL_DETECTORS)
 
 

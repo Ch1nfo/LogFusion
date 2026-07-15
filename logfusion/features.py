@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-FEATURE_SCHEMA_VERSION = "1"
+FEATURE_SCHEMA_VERSION = "2"
 CANONICAL_SCHEMA_VERSION = "v0"
 INT64_MAX = 2**63 - 1
 INT64_MIN = -(2**63)
@@ -72,6 +72,7 @@ class FeatureEngine:
         self.connection.execute("PRAGMA synchronous = NORMAL")
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        self._reject_old_schema()
         self._create_schema()
         self._initialize_meta()
 
@@ -202,6 +203,39 @@ class FeatureEngine:
         ).fetchall()
         return [_serialize_row(row) for row in rows]
 
+    def query_event_evidence(
+        self,
+        user_name: str,
+        start: str | int | datetime,
+        end: str | int | datetime,
+        *,
+        limit: int = 20,
+        source_types: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Query compact immutable event references without exposing raw event text."""
+        start_ms, end_ms = _timestamp_ms(start), _timestamp_ms(end)
+        if end_ms <= start_ms or limit <= 0:
+            raise FeatureError("evidence query requires end after start and a positive limit")
+        clauses = ["user_name = ?", "event_time >= ?", "event_time < ?"]
+        values: list[Any] = [user_name, start_ms, end_ms]
+        if source_types:
+            clauses.append(f"source_type IN ({','.join('?' for _ in source_types)})")
+            values.extend(source_types)
+        where = " AND ".join(clauses)
+        total = int(self.connection.execute(f"SELECT COUNT(*) FROM event_evidence WHERE {where}", values).fetchone()[0])
+        rows = self.connection.execute(
+            f"SELECT * FROM event_evidence WHERE {where} ORDER BY event_time,event_id LIMIT ?",
+            [*values, limit],
+        ).fetchall()
+        return {
+            "user_name": user_name,
+            "from": _iso(start_ms),
+            "to": _iso(end_ms),
+            "event_count": total,
+            "evidence_truncated": total > limit,
+            "events": [_serialize_row(row) for row in rows],
+        }
+
     def value_stats(self, user_name: str, value_type: str, value_key: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM user_value_stats WHERE user_name = ? AND value_type = ? AND value_key = ?",
@@ -242,11 +276,29 @@ class FeatureEngine:
             """,
             (event_id, fields["event_time"], fields["user_name"], CANONICAL_SCHEMA_VERSION, FEATURE_SCHEMA_VERSION, _now_ms()),
         )
+        self._insert_event_evidence(fields, revision)
         self._update_activity_bounds(fields, revision)
         self._update_windows(fields, revision)
         self._update_value_stats(fields, revision)
         session_row_id = self._update_sessions(fields, revision)
         return FeatureResult("processed", revision=revision, windows_updated=len(self.config.window_sizes_seconds), session_row_id=session_row_id)
+
+    def _insert_event_evidence(self, fields: dict[str, Any], revision: int) -> None:
+        values = {**fields, "feature_revision": revision}
+        self.connection.execute(
+            """
+            INSERT INTO event_evidence(
+                event_id, feature_revision, event_time, user_name, category, event_type, action, outcome,
+                source_id, source_type, source_ip, destination_ip, host_name, resource_type, resource_name,
+                http_method, http_status, parser_id, parser_version, record_id, checksum, storage_ref
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(values[key] for key in (
+                "event_id", "feature_revision", "event_time", "user_name", "category", "event_type", "action", "outcome",
+                "source_id", "source_type", "source_ip", "destination_ip", "host_name", "resource_type", "resource_name",
+                "http_method", "http_status", "parser_id", "parser_version", "record_id", "checksum", "storage_ref",
+            )),
+        )
 
     def _update_windows(self, fields: dict[str, Any], revision: int) -> None:
         outcome = _outcome_class(fields["outcome"], self.config)
@@ -559,6 +611,13 @@ class FeatureEngine:
                 skip_reason TEXT, canonical_schema_version TEXT NOT NULL, feature_schema_version TEXT NOT NULL,
                 processed_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_evidence (
+                event_id TEXT PRIMARY KEY, feature_revision INTEGER NOT NULL, event_time INTEGER NOT NULL, user_name TEXT NOT NULL,
+                category TEXT, event_type TEXT, action TEXT NOT NULL, outcome TEXT NOT NULL,
+                source_id TEXT NOT NULL, source_type TEXT NOT NULL, source_ip TEXT, destination_ip TEXT, host_name TEXT,
+                resource_type TEXT, resource_name TEXT, http_method TEXT, http_status INTEGER,
+                parser_id TEXT, parser_version TEXT, record_id TEXT, checksum TEXT, storage_ref TEXT
+            );
             CREATE TABLE IF NOT EXISTS user_windows (
                 user_name TEXT NOT NULL, window_size INTEGER NOT NULL, window_start INTEGER NOT NULL, window_end INTEGER NOT NULL,
                 event_count INTEGER NOT NULL, success_count INTEGER NOT NULL, failure_count INTEGER NOT NULL,
@@ -599,12 +658,28 @@ class FeatureEngine:
                 updated_revision INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_windows_user_time ON user_windows(user_name, window_start);
+            CREATE INDEX IF NOT EXISTS idx_event_evidence_user_time ON event_evidence(user_name, event_time, event_id);
+            CREATE INDEX IF NOT EXISTS idx_event_evidence_revision ON event_evidence(feature_revision, event_id);
             CREATE INDEX IF NOT EXISTS idx_window_values_user_time ON window_value_counts(user_name, window_size, window_start);
             CREATE INDEX IF NOT EXISTS idx_value_stats_user ON user_value_stats(user_name, value_type, value_key);
             CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON user_sessions(user_name, status, start_time, last_event_time);
             """
         )
         self.connection.commit()
+
+    def _reject_old_schema(self) -> None:
+        table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='feature_meta'"
+        ).fetchone()
+        if table is None:
+            return
+        row = self.connection.execute(
+            "SELECT value FROM feature_meta WHERE key='feature_schema_version'"
+        ).fetchone()
+        if row is not None and row[0] != FEATURE_SCHEMA_VERSION:
+            raise FeatureError(
+                "feature schema version changed; rebuild Feature, Baseline, Detection, Incident, Risk, Case, and Evaluation DBs from Canonical/Raw"
+            )
 
     def _initialize_meta(self) -> None:
         existing_schema = self._meta("feature_schema_version")
@@ -713,7 +788,7 @@ def _event_fields(event: dict[str, Any]) -> dict[str, Any]:
     event_time = _timestamp_ms(_required_string(event, "event.time"))
     user_name = _required_string(event, "user.name")
     source_type = _required_string(event, "raw.source_type")
-    _required_string(event, "raw.source_id")
+    source_id = _required_string(event, "raw.source_id")
     action = _required_string(event, "event.action")
     outcome = _required_string(event, "event.outcome")
     source_ip = _optional_string(event, "source.ip")
@@ -721,6 +796,9 @@ def _event_fields(event: dict[str, Any]) -> dict[str, Any]:
     resource_id = _optional_string(event, "resource.id")
     resource_name = _optional_string(event, "resource.name")
     resource_key, resource_display = _resource_key(resource_type, resource_id, resource_name)
+    http_status = _path(event, "http.response.status_code")
+    if http_status is not None and (isinstance(http_status, bool) or not isinstance(http_status, int)):
+        raise FeatureError("http.response.status_code must be an integer")
     network_bytes = _path(event, "network.bytes")
     if network_bytes is None:
         network_bytes = 0
@@ -730,12 +808,26 @@ def _event_fields(event: dict[str, Any]) -> dict[str, Any]:
         "event_id": event_id,
         "event_time": event_time,
         "user_name": user_name,
+        "category": _optional_string(event, "event.category"),
+        "event_type": _optional_string(event, "event.type"),
         "source_type": source_type,
+        "source_id": source_id,
         "source_ip": source_ip,
+        "destination_ip": _optional_string(event, "destination.ip"),
+        "host_name": _optional_string(event, "host.name"),
+        "resource_type": resource_type,
+        "resource_name": resource_name,
         "resource_key": resource_key,
         "resource_display": resource_display,
         "action": action,
         "outcome": outcome,
+        "http_method": _optional_string(event, "http.request.method"),
+        "http_status": http_status,
+        "parser_id": _optional_string(event, "parser.id"),
+        "parser_version": _optional_string(event, "parser.version"),
+        "record_id": _optional_string(event, "raw.record_id"),
+        "checksum": _optional_string(event, "raw.checksum"),
+        "storage_ref": _optional_string(event, "raw.storage_ref"),
         "network_bytes": network_bytes,
     }
 

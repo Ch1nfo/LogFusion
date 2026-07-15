@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-CORRELATION_SCHEMA_VERSION = "1"
-FEATURE_SCHEMA_VERSION = "1"
-DETECTION_SCHEMA_VERSION = "2"
+CORRELATION_SCHEMA_VERSION = "2"
+FEATURE_SCHEMA_VERSION = "2"
+DETECTION_SCHEMA_VERSION = "3"
 
 
 class CorrelationError(ValueError):
@@ -74,9 +74,10 @@ class CorrelationEngine:
 
     def run(self) -> dict[str, Any]:
         feature_revision = int(_meta_map(self.feature, "feature_meta").get("current_revision", "0"))
-        detection_revision = int(_meta_map(self.detection, "detection_meta").get("last_consumed_feature_revision", "0"))
-        if detection_revision != feature_revision:
+        detection_meta = _meta_map(self.detection, "detection_meta")
+        if int(detection_meta.get("last_consumed_feature_revision", "0")) != feature_revision:
             raise CorrelationError("Detection DB is behind Feature DB; run detect run first")
+        detection_revision = int(detection_meta.get("current_detection_revision", "0"))
         previous_revision = self._meta_int("last_consumed_detection_revision", 0)
         if previous_revision == detection_revision:
             return {
@@ -87,7 +88,7 @@ class CorrelationEngine:
                 "by_type": {},
             }
         candidates = self.detection.execute(
-            "SELECT * FROM anomaly_candidates WHERE status = 'active' ORDER BY user_name, window_start, score DESC, candidate_id"
+            "SELECT * FROM anomaly_candidates WHERE status = 'active' AND detector_mode = 'active' ORDER BY user_name, window_start, score DESC, candidate_id"
         ).fetchall()
         groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
         group_sessions: dict[tuple[str, str], sqlite3.Row | None] = {}
@@ -137,7 +138,7 @@ class CorrelationEngine:
         return [self._serialize_incident(row) for row in rows]
 
     def _group_key(self, candidate: sqlite3.Row) -> tuple[str, sqlite3.Row | None]:
-        if int(candidate["window_size"]) == self.config.session_window_size_seconds:
+        if 0 <= int(candidate["window_size"]) <= self.config.session_window_size_seconds:
             sessions = self.feature.execute(
                 """
                 SELECT * FROM user_sessions
@@ -159,8 +160,10 @@ class CorrelationEngine:
                 session_key = session["session_id"] or f"provisional:{session['session_row_id']}"
                 return f"session:{session_key}", session
         width = self.config.fallback_bucket_seconds * 1000
+        if int(candidate["window_size"]) == 86_400:
+            return f"day:{candidate['window_start']}", None
         bucket = (int(candidate["window_start"]) // width) * width
-        return f"bucket:{candidate['window_size']}:{bucket}", None
+        return f"bucket:{bucket}", None
 
     def _build_incident(
         self,
@@ -176,10 +179,27 @@ class CorrelationEngine:
         source_types: set[str] = set()
         source_ips: set[str] = set()
         resources: set[str] = set()
-        detectors: set[str] = set()
+        detectors: set[tuple[str, str]] = set()
+        detector_families: set[str] = set()
         timeline: list[dict[str, Any]] = []
         for candidate in candidates:
-            detectors.add(candidate["detector_id"])
+            detectors.add((candidate["detector_family"], candidate["detector_id"]))
+            detector_families.add(candidate["detector_family"])
+            evidence_rows = self.detection.execute(
+                "SELECT event_id,source_type FROM candidate_evidence WHERE candidate_id=? ORDER BY evidence_order",
+                (candidate["candidate_id"],),
+            ).fetchall()
+            source_types.update(row["source_type"] for row in evidence_rows)
+            event_ids = [row["event_id"] for row in evidence_rows]
+            if event_ids:
+                for row in self.feature.execute(
+                    f"SELECT source_ip,resource_type,resource_name FROM event_evidence WHERE event_id IN ({','.join('?' for _ in event_ids)})",
+                    event_ids,
+                ):
+                    if row["source_ip"]:
+                        source_ips.add(row["source_ip"])
+                    if row["resource_type"] or row["resource_name"]:
+                        resources.add(f"{row['resource_type'] or '<unknown_type>'}:{row['resource_name'] or '<unknown_resource>'}")
             for row in self.feature.execute(
                 """
                 SELECT value_type, value_key FROM window_value_counts
@@ -198,6 +218,8 @@ class CorrelationEngine:
                 "window_start": _iso(int(candidate["window_start"])),
                 "window_end": _iso(int(candidate["window_end"])),
                 "detector_id": candidate["detector_id"],
+                "detector_family": candidate["detector_family"],
+                "detector_version": candidate["detector_version"],
                 "metric": candidate["metric"],
                 "value_type": candidate["value_type"],
                 "value_key": candidate["value_key"],
@@ -214,7 +236,7 @@ class CorrelationEngine:
         score = min(100, max_score + bonus)
         if len(source_types) > 1:
             incident_type = "cross_system_behavior_anomaly"
-        elif len(detectors) > 1:
+        elif len(detector_families) > 1:
             incident_type = "compound_behavior_anomaly"
         else:
             incident_type = "user_behavior_anomaly"
@@ -231,12 +253,14 @@ class CorrelationEngine:
             "severity": _severity(score),
             "candidate_count": len(candidates),
             "detector_count": len(detectors),
+            "detector_family_count": len(detector_families),
+            "detector_families": sorted(detector_families),
             "source_types": sorted(source_types),
             "source_ips": sorted(source_ips),
             "resources": sorted(resources),
             "timeline": timeline,
             "evidence": {
-                "candidate_ids": [item["candidate_id"] for item in timeline],
+                "candidate_ids": [item["candidate_id"] for item in timeline], "detector_families": sorted(detector_families),
                 "aggregation_method": "max_score_plus_candidate_bonus",
                 "max_candidate_score": max_score,
                 "candidate_bonus": bonus,
@@ -251,15 +275,16 @@ class CorrelationEngine:
             INSERT INTO incidents(
                 incident_id, incident_key, user_name, correlation_key, session_id,
                 first_seen, last_seen, incident_type, aggregation_score, severity,
-                candidate_count, detector_count, source_types_json, source_ips_json, resources_json,
+                candidate_count, detector_count, detector_family_count, detector_families_json, source_types_json, source_ips_json, resources_json,
                 timeline_json, evidence_json, source_detection_revision, status,
                 supersedes_incident_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
             """,
             (
                 incident["incident_id"], incident["incident_key"], incident["user_name"], incident["correlation_key"],
                 incident["session_id"], incident["first_seen"], incident["last_seen"], incident["incident_type"],
                 incident["aggregation_score"], incident["severity"], incident["candidate_count"], incident["detector_count"],
+                incident["detector_family_count"], json.dumps(incident["detector_families"], ensure_ascii=False),
                 json.dumps(incident["source_types"], ensure_ascii=False), json.dumps(incident["source_ips"], ensure_ascii=False),
                 json.dumps(incident["resources"], ensure_ascii=False), json.dumps(incident["timeline"], ensure_ascii=False, sort_keys=True),
                 json.dumps(incident["evidence"], ensure_ascii=False, sort_keys=True), incident["source_detection_revision"],
@@ -275,7 +300,7 @@ class CorrelationEngine:
         result = dict(row)
         for field in ("first_seen", "last_seen", "created_at", "updated_at"):
             result[field] = _iso(int(result[field]))
-        for field in ("source_types", "source_ips", "resources", "timeline", "evidence"):
+        for field in ("detector_families", "source_types", "source_ips", "resources", "timeline", "evidence"):
             result[field] = json.loads(result.pop(f"{field}_json"))
         return result
 
@@ -300,6 +325,7 @@ class CorrelationEngine:
                 correlation_key TEXT NOT NULL, session_id TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
                 incident_type TEXT NOT NULL, aggregation_score INTEGER NOT NULL, severity TEXT NOT NULL,
                 candidate_count INTEGER NOT NULL, detector_count INTEGER NOT NULL,
+                detector_family_count INTEGER NOT NULL, detector_families_json TEXT NOT NULL,
                 source_types_json TEXT NOT NULL, source_ips_json TEXT NOT NULL, resources_json TEXT NOT NULL,
                 timeline_json TEXT NOT NULL, evidence_json TEXT NOT NULL, source_detection_revision INTEGER NOT NULL,
                 status TEXT NOT NULL, supersedes_incident_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -373,6 +399,8 @@ def query_incident_state(
     connection = _readonly(path)
     try:
         meta = _meta_map(connection, "correlation_meta")
+        if meta.get("correlation_schema_version") != CORRELATION_SCHEMA_VERSION:
+            raise CorrelationError("correlation schema version changed; rebuild Incident DB")
         start_ms, end_ms = _timestamp_ms(start), _timestamp_ms(end)
         rows = connection.execute(
             """
@@ -387,7 +415,7 @@ def query_incident_state(
             document = dict(row)
             for field in ("first_seen", "last_seen", "created_at", "updated_at"):
                 document[field] = _iso(int(document[field]))
-            for field in ("source_types", "source_ips", "resources", "timeline", "evidence"):
+            for field in ("detector_families", "source_types", "source_ips", "resources", "timeline", "evidence"):
                 document[field] = json.loads(document.pop(f"{field}_json"))
             result.append(document)
         return {

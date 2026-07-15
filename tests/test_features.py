@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import sqlite3
 
 import pytest
 
@@ -124,6 +125,13 @@ def test_dedup_rejections_revisions_and_resource_keys(tmp_path):
     windows = engine.query_windows("wangkun78", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z", 3600)
     assert windows[0]["resource_distinct_count"] == 2
     assert engine.current_revision() == second.revision
+    evidence = engine.query_event_evidence(
+        "wangkun78", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z", limit=1,
+    )
+    assert evidence["event_count"] == 2
+    assert evidence["evidence_truncated"] is True
+    assert len(evidence["events"]) == 1
+    assert "raw_text" not in evidence["events"][0]
 
 
 def test_network_bytes_overflow_rolls_back_entire_event(tmp_path):
@@ -181,3 +189,12 @@ def test_finalized_replay_state_can_transition_to_realtime(tmp_path):
     with FeatureEngine(state, mode="realtime") as realtime:
         result = realtime.process_event(_event("live", "2026-07-01T11:00:00Z"))
         assert result.status == "processed"
+
+
+def test_feature_v1_state_is_explicitly_rejected_before_upgrade(tmp_path):
+    state = tmp_path / "features.db"
+    with sqlite3.connect(state) as connection:
+        connection.execute("CREATE TABLE feature_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute("INSERT INTO feature_meta VALUES ('feature_schema_version','1')")
+    with pytest.raises(FeatureError, match="rebuild Feature, Baseline, Detection"):
+        FeatureEngine(state)

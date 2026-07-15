@@ -9,10 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from logfusion.rules import load_rules, match_rule, rule_fingerprint
 
-DETECTION_SCHEMA_VERSION = "2"
-FEATURE_SCHEMA_VERSION = "1"
-BASELINE_SCHEMA_VERSION = "2"
+
+DETECTION_SCHEMA_VERSION = "3"
+FEATURE_SCHEMA_VERSION = "2"
+BASELINE_SCHEMA_VERSION = "3"
+EVIDENCE_LIMIT = 20
 WINDOW_SIZES = (3600, 86400)
 METRICS = (
     "event_count", "success_count", "failure_count", "other_outcome_count",
@@ -51,6 +54,7 @@ class DetectionEngine:
         baseline_state: Path | str,
         detection_state: Path | str,
         config: DetectionConfig | None = None,
+        rules_path: Path | str | None = None,
     ) -> None:
         self.feature_path = Path(feature_state)
         self.baseline_path = Path(baseline_state)
@@ -59,6 +63,9 @@ class DetectionEngine:
         self.detection_path = Path(detection_state)
         self.detection_path.parent.mkdir(parents=True, exist_ok=True)
         self.config = config or DetectionConfig()
+        self.rules_path = Path(rules_path) if rules_path is not None else None
+        self.rules = load_rules(self.rules_path) if self.rules_path is not None else {"schema_version": 1, "rules": []}
+        self.rules_fingerprint = _runtime_rules_fingerprint(self.rules)
         if not 0 < self.config.rare_share_threshold <= 1 or self.config.rare_event_count_max <= 0 or any(not 0 <= value <= 100 for value in (self.config.p95_score, self.config.p99_score, self.config.new_value_score, self.config.rare_value_score)):
             raise DetectionError("invalid detection configuration")
         self.feature = _readonly(self.feature_path)
@@ -67,8 +74,10 @@ class DetectionEngine:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA synchronous = NORMAL")
+        self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self._verify_inputs()
+        self._reject_old_schema()
         self._create_schema()
         self._initialize_meta()
 
@@ -83,12 +92,16 @@ class DetectionEngine:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def run(self) -> dict[str, Any]:
+    def run(self, refresh_rules: bool = False) -> dict[str, Any]:
         feature_revision = self._feature_revision()
         baseline_revision = self._baseline_revision()
         if baseline_revision != feature_revision:
             raise DetectionError("Baseline DB is behind Feature DB; run baseline build first")
         previous_revision = self._meta_int("last_consumed_feature_revision", 0)
+        previous_detection_revision = self._meta_int("current_detection_revision", 0)
+        stored_rules_fingerprint = self._meta("rules_fingerprint") or _fingerprint({"schema_version": 1, "rules": []})
+        if stored_rules_fingerprint != self.rules_fingerprint and not refresh_rules:
+            raise DetectionError("rule configuration changed; rerun detect with --refresh-rules")
         rows = self.feature.execute(
             """
             SELECT * FROM user_windows
@@ -102,6 +115,11 @@ class DetectionEngine:
         superseded_count = 0
         skipped: dict[str, int] = {}
         with self._transaction():
+            if refresh_rules:
+                superseded_count += self.connection.execute(
+                    "UPDATE anomaly_candidates SET status='superseded',updated_at=? WHERE detector_family='rule' AND status='active'",
+                    (_now_ms(),),
+                ).rowcount
             for window in rows:
                 superseded_count += self._supersede_window(window)
                 candidates, reasons = self._detect_window(window, baseline_revision)
@@ -111,16 +129,101 @@ class DetectionEngine:
                     if self._insert_candidate(candidate):
                         candidate_count += 1
                         detector_count[candidate["detector_id"]] = detector_count.get(candidate["detector_id"], 0) + 1
+            rule_report = self._run_rules(0 if refresh_rules else previous_revision)
+            candidate_count += rule_report["candidate_count"]
+            for detector_id, count in rule_report["by_detector"].items():
+                detector_count[detector_id] = detector_count.get(detector_id, 0) + count
             self._set_meta("last_consumed_feature_revision", str(feature_revision))
             self._set_meta("last_consumed_baseline_revision", str(baseline_revision))
+            self._set_meta("rules_fingerprint", self.rules_fingerprint)
+            detection_revision = previous_detection_revision + int(feature_revision != previous_revision or refresh_rules)
+            self._set_meta("current_detection_revision", str(detection_revision))
         return {
+            "processed_detection_revision": detection_revision,
             "processed_feature_revision": feature_revision,
             "processed_baseline_revision": baseline_revision,
             "scanned_windows": len(rows),
             "candidate_count": candidate_count,
             "superseded_count": superseded_count,
             "by_detector": detector_count,
+            "rules": rule_report,
             "skipped": skipped,
+        }
+
+    def _run_rules(self, after_revision: int) -> dict[str, Any]:
+        rules = [rule for rule in self.rules["rules"] if rule["status"] in {"shadow", "active"}]
+        count = 0
+        by_detector: dict[str, int] = {}
+        event_rules = [rule for rule in rules if rule["scope"] == "event"]
+        if event_rules:
+            events = self.feature.execute(
+                "SELECT * FROM event_evidence WHERE feature_revision > ? ORDER BY feature_revision,event_id",
+                (after_revision,),
+            ).fetchall()
+            for event in events:
+                document = _event_rule_document(event)
+                for rule in event_rules:
+                    if match_rule(rule, document):
+                        candidate = self._rule_event_candidate(rule, event)
+                        if self._insert_candidate(candidate):
+                            count += 1
+                            by_detector[rule["rule_id"]] = by_detector.get(rule["rule_id"], 0) + 1
+        window_rules = [rule for rule in rules if rule["scope"] == "window"]
+        if window_rules:
+            windows = self.feature.execute(
+                "SELECT * FROM user_windows WHERE updated_revision > ? ORDER BY updated_revision,user_name,window_size,window_start",
+                (after_revision,),
+            ).fetchall()
+            for window in windows:
+                source_types = [row[0] for row in self.feature.execute(
+                    "SELECT value_key FROM window_value_counts WHERE user_name=? AND window_size=? AND window_start=? AND value_type='source_type' ORDER BY value_key",
+                    (window["user_name"], window["window_size"], window["window_start"]),
+                )]
+                document = {**dict(window), "source_types": source_types}
+                for rule in window_rules:
+                    if rule["window_size"] == window["window_size"] and match_rule(rule, document):
+                        candidate = self._rule_window_candidate(rule, window, source_types)
+                        if self._insert_candidate(candidate):
+                            count += 1
+                            by_detector[rule["rule_id"]] = by_detector.get(rule["rule_id"], 0) + 1
+        return {"candidate_count": count, "by_detector": by_detector, "evaluated_rule_count": len(rules)}
+
+    def _rule_event_candidate(self, rule: dict[str, Any], event: sqlite3.Row) -> dict[str, Any]:
+        fingerprint = rule_fingerprint(rule)
+        candidate_key = hashlib.sha256(f"rule:event:{rule['rule_id']}:{rule['version']}:{fingerprint}:{event['event_id']}".encode()).hexdigest()
+        return {
+            "candidate_id": hashlib.sha256(f"{candidate_key}:{event['feature_revision']}".encode()).hexdigest(),
+            "candidate_key": candidate_key,
+            "user_name": event["user_name"], "entity_type": "user", "entity_id": event["user_name"],
+            "window_size": 0, "window_start": int(event["event_time"]), "window_end": int(event["event_time"]) + 1,
+            "detector_family": "rule", "detector_id": rule["rule_id"], "detector_version": str(rule["version"]),
+            "detector_mode": rule["status"], "config_fingerprint": fingerprint,
+            "metric": None, "value_type": None, "value_key": None, "baseline_group_id": None,
+            "score": rule["score"], "severity": _severity(rule["score"]), "baseline_scope": None,
+            "feature_revision": int(event["feature_revision"]), "baseline_revision": None,
+            "explanation": _rule_explanation(rule, "event"),
+            "evidence": [_evidence(event, f"rule_match:{rule['rule_id']}")],
+            "evidence_query": {"kind": "event", "event_count": 1, "evidence_truncated": False},
+        }
+
+    def _rule_window_candidate(self, rule: dict[str, Any], window: sqlite3.Row, source_types: list[str]) -> dict[str, Any]:
+        fingerprint = rule_fingerprint(rule)
+        identity = f"rule:window:{rule['rule_id']}:{rule['version']}:{fingerprint}:{window['user_name']}:{window['window_size']}:{window['window_start']}"
+        candidate_key = hashlib.sha256(identity.encode()).hexdigest()
+        evidence, query = self._window_evidence(window, rule.get("source_types") or None)
+        for item in evidence:
+            item["reason"] = f"rule_match:{rule['rule_id']}"
+        return {
+            "candidate_id": hashlib.sha256(f"{candidate_key}:{window['updated_revision']}".encode()).hexdigest(),
+            "candidate_key": candidate_key,
+            "user_name": window["user_name"], "entity_type": "user", "entity_id": window["user_name"],
+            "window_size": int(window["window_size"]), "window_start": int(window["window_start"]), "window_end": int(window["window_end"]),
+            "detector_family": "rule", "detector_id": rule["rule_id"], "detector_version": str(rule["version"]),
+            "detector_mode": rule["status"], "config_fingerprint": fingerprint,
+            "metric": None, "value_type": None, "value_key": None, "baseline_group_id": None,
+            "score": rule["score"], "severity": _severity(rule["score"]), "baseline_scope": None,
+            "feature_revision": int(window["updated_revision"]), "baseline_revision": None,
+            "explanation": _rule_explanation(rule, "window"), "evidence": evidence, "evidence_query": query,
         }
 
     def query(self, user_name: str, start: str | int | datetime, end: str | int | datetime) -> list[dict[str, Any]]:
@@ -136,7 +239,7 @@ class DetectionEngine:
             """,
             (user_name, end_ms, start_ms),
         ).fetchall()
-        return [_serialize_candidate(row) for row in rows]
+        return [_serialize_candidate(row, self.connection) for row in rows]
 
     def _detect_window(self, window: sqlite3.Row, baseline_revision: int) -> tuple[list[dict[str, Any]], list[str]]:
         candidates: list[dict[str, Any]] = []
@@ -254,13 +357,34 @@ class DetectionEngine:
         candidate_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         revision = int(window["updated_revision"])
         candidate_id = hashlib.sha256(f"{candidate_key}:{revision}".encode("utf-8")).hexdigest()
+        evidence, evidence_query = self._window_evidence(window)
         return {
             "candidate_id": candidate_id, "candidate_key": candidate_key, "user_name": window["user_name"],
+            "entity_type": "user", "entity_id": window["user_name"],
             "window_size": int(window["window_size"]), "window_start": int(window["window_start"]), "window_end": int(window["window_end"]),
-            "detector_id": detector_id, "metric": metric, "value_type": value_type, "value_key": value_key,
+            "detector_family": "statistical", "detector_id": detector_id, "detector_version": "1", "detector_mode": "active",
+            "config_fingerprint": self.config.fingerprint(), "metric": metric, "value_type": value_type, "value_key": value_key,
             "score": score, "severity": _severity(score), "baseline_scope": scope,
             "baseline_group_id": group_id if scope == "peer_group" else None,
             "feature_revision": revision, "baseline_revision": baseline_revision, "explanation": explanation,
+            "evidence": evidence, "evidence_query": evidence_query,
+        }
+
+    def _window_evidence(self, window: sqlite3.Row, source_types: list[str] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        clauses = ["user_name=?", "event_time>=?", "event_time<?"]
+        values: list[Any] = [window["user_name"], window["window_start"], window["window_end"]]
+        if source_types:
+            clauses.append(f"source_type IN ({','.join('?' for _ in source_types)})")
+            values.extend(source_types)
+        where = " AND ".join(clauses)
+        total = int(self.feature.execute(f"SELECT COUNT(*) FROM event_evidence WHERE {where}", values).fetchone()[0])
+        rows = self.feature.execute(
+            f"SELECT * FROM event_evidence WHERE {where} ORDER BY event_time,event_id LIMIT ?", [*values, EVIDENCE_LIMIT]
+        ).fetchall()
+        return [_evidence(row, "window_member") for row in rows], {
+            "kind": "window", "user_name": window["user_name"], "window_start": int(window["window_start"]),
+            "window_end": int(window["window_end"]), "event_count": total, "evidence_limit": EVIDENCE_LIMIT,
+            "evidence_truncated": total > EVIDENCE_LIMIT, "source_types": source_types or [],
         }
 
     def _insert_candidate(self, candidate: dict[str, Any]) -> bool:
@@ -272,23 +396,37 @@ class DetectionEngine:
             self.connection.execute(
                 """
                 INSERT INTO anomaly_candidates(
-                    candidate_id, candidate_key, user_name, window_size, window_start, window_end,
-                    detector_id, metric, value_type, value_key, baseline_group_id, score, severity, baseline_scope,
-                    feature_revision, baseline_revision, explanation_json, status, supersedes_candidate_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                    candidate_id, candidate_key, user_name, entity_type, entity_id, window_size, window_start, window_end,
+                    detector_family, detector_id, detector_version, detector_mode, config_fingerprint,
+                    metric, value_type, value_key, baseline_group_id, score, severity, baseline_scope,
+                    feature_revision, baseline_revision, explanation_json, evidence_query_json,
+                    status, supersedes_candidate_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
-                    candidate["candidate_id"], candidate["candidate_key"], candidate["user_name"], candidate["window_size"],
-                    candidate["window_start"], candidate["window_end"], candidate["detector_id"], candidate["metric"],
+                    candidate["candidate_id"], candidate["candidate_key"], candidate["user_name"], candidate["entity_type"], candidate["entity_id"],
+                    candidate["window_size"], candidate["window_start"], candidate["window_end"], candidate["detector_family"],
+                    candidate["detector_id"], candidate["detector_version"], candidate["detector_mode"], candidate["config_fingerprint"], candidate["metric"],
                     candidate["value_type"], candidate["value_key"], candidate["baseline_group_id"], candidate["score"], candidate["severity"],
                     candidate["baseline_scope"], candidate["feature_revision"], candidate["baseline_revision"],
-                    json.dumps(candidate["explanation"], ensure_ascii=False, sort_keys=True), previous["candidate_id"] if previous else None,
+                    json.dumps(candidate["explanation"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(candidate["evidence_query"], ensure_ascii=False, sort_keys=True), previous["candidate_id"] if previous else None,
                     _now_ms(), _now_ms(),
                 ),
             )
-            return True
         except sqlite3.IntegrityError:
+            self.connection.execute("UPDATE anomaly_candidates SET status='active',updated_at=? WHERE candidate_id=?", (_now_ms(), candidate["candidate_id"]))
             return False
+        self.connection.executemany(
+            """INSERT OR IGNORE INTO candidate_evidence(
+                candidate_id,evidence_order,event_id,event_time,record_id,source_id,source_type,storage_ref,checksum,reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [(
+                candidate["candidate_id"], index, item["event_id"], item["event_time"], item.get("record_id"),
+                item["source_id"], item["source_type"], item.get("storage_ref"), item.get("checksum"), item["reason"],
+            ) for index, item in enumerate(candidate["evidence"])],
+        )
+        return True
 
     def _supersede_window(self, window: sqlite3.Row) -> int:
         cursor = self.connection.execute(
@@ -368,19 +506,44 @@ class DetectionEngine:
             CREATE TABLE IF NOT EXISTS detection_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS anomaly_candidates (
                 candidate_id TEXT PRIMARY KEY, candidate_key TEXT NOT NULL, user_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
                 window_size INTEGER NOT NULL, window_start INTEGER NOT NULL, window_end INTEGER NOT NULL,
-                detector_id TEXT NOT NULL, metric TEXT, value_type TEXT, value_key TEXT, baseline_group_id TEXT,
-                score INTEGER NOT NULL, severity TEXT NOT NULL, baseline_scope TEXT NOT NULL,
-                feature_revision INTEGER NOT NULL, baseline_revision INTEGER NOT NULL,
-                explanation_json TEXT NOT NULL, status TEXT NOT NULL, supersedes_candidate_id TEXT,
+                detector_family TEXT NOT NULL, detector_id TEXT NOT NULL, detector_version TEXT NOT NULL,
+                detector_mode TEXT NOT NULL, config_fingerprint TEXT NOT NULL,
+                metric TEXT, value_type TEXT, value_key TEXT, baseline_group_id TEXT,
+                score INTEGER NOT NULL, severity TEXT NOT NULL, baseline_scope TEXT,
+                feature_revision INTEGER NOT NULL, baseline_revision INTEGER,
+                explanation_json TEXT NOT NULL, evidence_query_json TEXT NOT NULL,
+                status TEXT NOT NULL, supersedes_candidate_id TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
                 UNIQUE(candidate_key, feature_revision)
             );
+            CREATE TABLE IF NOT EXISTS candidate_evidence (
+                candidate_id TEXT NOT NULL, evidence_order INTEGER NOT NULL, event_id TEXT NOT NULL, event_time INTEGER NOT NULL,
+                record_id TEXT, source_id TEXT NOT NULL, source_type TEXT NOT NULL, storage_ref TEXT, checksum TEXT, reason TEXT NOT NULL,
+                PRIMARY KEY(candidate_id,evidence_order), FOREIGN KEY(candidate_id) REFERENCES anomaly_candidates(candidate_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_candidates_user_time ON anomaly_candidates(user_name, window_start, status);
             CREATE INDEX IF NOT EXISTS idx_candidates_key ON anomaly_candidates(candidate_key, feature_revision);
+            CREATE INDEX IF NOT EXISTS idx_candidates_family_mode ON anomaly_candidates(detector_family,detector_mode,status);
+            CREATE INDEX IF NOT EXISTS idx_candidate_evidence_event ON candidate_evidence(event_id,candidate_id);
             """
         )
         self.connection.commit()
+
+    def _reject_old_schema(self) -> None:
+        table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_meta'"
+        ).fetchone()
+        if table is None:
+            return
+        row = self.connection.execute(
+            "SELECT value FROM detection_meta WHERE key='detection_schema_version'"
+        ).fetchone()
+        if row is not None and row[0] != DETECTION_SCHEMA_VERSION:
+            raise DetectionError(
+                "detection schema version changed; rebuild Detection, Incident, Risk, Case, and Evaluation DBs from Feature/Baseline"
+            )
 
     def _initialize_meta(self) -> None:
         fingerprint = self.config.fingerprint()
@@ -391,6 +554,8 @@ class DetectionEngine:
                 "feature_config_fingerprint": self.feature_fingerprint,
                 "baseline_config_fingerprint": self.baseline_fingerprint,
                 "detection_config_fingerprint": fingerprint,
+                "rules_fingerprint": self.rules_fingerprint,
+                "current_detection_revision": "0",
                 "last_consumed_feature_revision": "0",
                 "last_consumed_baseline_revision": "0",
             }
@@ -456,7 +621,8 @@ def query_detection_state(
             "user_name": user_name,
             "from": _iso(start_ms), "to": _iso(end_ms),
             "processed_feature_revision": int(meta.get("last_consumed_feature_revision", "0")),
-            "candidates": [_serialize_candidate(row) for row in rows],
+            "processed_detection_revision": int(meta.get("current_detection_revision", "0")),
+            "candidates": [_serialize_candidate(row, connection) for row in rows],
         }
     finally:
         connection.close()
@@ -505,9 +671,55 @@ def _iso(value: int) -> str:
     return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _serialize_candidate(row: sqlite3.Row) -> dict[str, Any]:
+def _serialize_candidate(row: sqlite3.Row, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
     result = dict(row)
     for field in ("window_start", "window_end", "created_at", "updated_at"):
         result[field] = _iso(int(result[field]))
     result["explanation"] = json.loads(result.pop("explanation_json"))
+    result["evidence_query"] = json.loads(result.pop("evidence_query_json"))
+    if connection is not None:
+        evidence = connection.execute(
+            "SELECT * FROM candidate_evidence WHERE candidate_id=? ORDER BY evidence_order", (result["candidate_id"],)
+        ).fetchall()
+        result["evidence"] = [
+            {**dict(item), "event_time": _iso(int(item["event_time"]))}
+            for item in evidence
+        ]
     return result
+
+
+def _fingerprint(document: dict[str, Any]) -> str:
+    payload = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _runtime_rules_fingerprint(document: dict[str, Any]) -> str:
+    return _fingerprint({
+        "schema_version": document.get("schema_version", 1),
+        "rules": [rule for rule in document.get("rules", []) if rule.get("status") in {"shadow", "active"}],
+    })
+
+
+def _event_rule_document(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "event.category": row["category"], "event.type": row["event_type"], "event.action": row["action"],
+        "event.outcome": row["outcome"], "user.name": row["user_name"], "source.ip": row["source_ip"],
+        "destination.ip": row["destination_ip"], "host.name": row["host_name"], "resource.type": row["resource_type"],
+        "resource.name": row["resource_name"], "http.request.method": row["http_method"],
+        "http.response.status_code": row["http_status"], "parser.id": row["parser_id"], "raw.source_type": row["source_type"],
+    }
+
+
+def _rule_explanation(rule: dict[str, Any], scope: str) -> dict[str, Any]:
+    return {
+        "kind": "rule_match", "scope": scope, "rule_id": rule["rule_id"], "rule_version": rule["version"],
+        "rule_name": rule["name"], "match": rule["match"], "conditions": rule["conditions"], "tags": rule["tags"],
+    }
+
+
+def _evidence(row: sqlite3.Row, reason: str) -> dict[str, Any]:
+    return {
+        "event_id": row["event_id"], "event_time": int(row["event_time"]), "record_id": row["record_id"],
+        "source_id": row["source_id"], "source_type": row["source_type"], "storage_ref": row["storage_ref"],
+        "checksum": row["checksum"], "reason": reason,
+    }

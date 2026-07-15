@@ -24,7 +24,7 @@ def _case_state(path, *, disposition: str = "confirmed_threat", user: str = "wan
       tags_json TEXT, suppression_until INTEGER, requires_review INTEGER, source_correlation_revision INTEGER, disposition TEXT NOT NULL,
       created_at INTEGER, updated_at INTEGER NOT NULL);
     """)
-    connection.execute("INSERT INTO case_meta(key,value) VALUES ('case_schema_version','1')")
+    connection.execute("INSERT INTO case_meta(key,value) VALUES ('case_schema_version','2')")
     connection.execute("INSERT INTO cases(case_id,user_name,first_seen,last_seen,disposition,updated_at) VALUES ('case-1',?,?,?,?,0)", (user, first_seen, last_seen, disposition))
     connection.commit()
     connection.close()

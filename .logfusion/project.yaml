@@ -1,0 +1,23 @@
+# LogFusion local project configuration.
+project:
+  name: "LogFusion"
+
+states:
+  feature: "output/features.db"
+  baseline: "output/baseline.db"
+  detection: "output/detection.db"
+  incident: "output/incidents.db"
+  risk: "output/risk.db"
+  case: "output/cases.db"
+  evaluation: "output/evaluation.db"
+
+files:
+  sources: "config/sources.yaml"
+  kafka: "config/kafka.local.yaml"
+  rules: "config/rules.local.json"
+  model_detection: "config/model-detection.local.yaml"
+  readiness_report: "output/readiness-report.json"
+
+runtime:
+  host: "127.0.0.1"
+  port: 8765

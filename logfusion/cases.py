@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-CASE_SCHEMA_VERSION = "1"
-FUSION_SCHEMA_VERSION = "1"
+CASE_SCHEMA_VERSION = "2"
+FUSION_SCHEMA_VERSION = "2"
 CASE_STATUSES = ("new", "acknowledged", "investigating", "resolved", "false_positive", "suppressed")
 CASE_DISPOSITIONS = ("confirmed_threat", "benign", "unknown")
 TERMINAL_CASE_STATUSES = {"resolved", "false_positive"}
@@ -297,6 +297,9 @@ def list_cases(case_state: Path | str, user_name: str | None = None, status: str
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
+        meta = _meta_map(connection, "case_meta")
+        if meta.get("case_schema_version") != CASE_SCHEMA_VERSION:
+            raise CaseError("case schema version changed; rebuild Case DB")
         engine = object.__new__(CaseEngine)
         engine.connection = connection
         return engine.list(user_name, status)
@@ -311,6 +314,9 @@ def get_case(case_state: Path | str, case_id: str) -> dict[str, Any]:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
+        meta = _meta_map(connection, "case_meta")
+        if meta.get("case_schema_version") != CASE_SCHEMA_VERSION:
+            raise CaseError("case schema version changed; rebuild Case DB")
         engine = object.__new__(CaseEngine)
         engine.connection = connection
         return engine.get(case_id)

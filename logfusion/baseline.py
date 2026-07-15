@@ -13,8 +13,8 @@ from statistics import median
 from typing import Any, Iterable, Iterator
 
 
-BASELINE_SCHEMA_VERSION = "2"
-FEATURE_SCHEMA_VERSION = "1"
+BASELINE_SCHEMA_VERSION = "3"
+FEATURE_SCHEMA_VERSION = "2"
 WINDOW_SIZES = (3600, 86400)
 METRICS = (
     "event_count", "success_count", "failure_count", "other_outcome_count",

@@ -16,7 +16,7 @@ from logfusion.features import FeatureEngine, FeatureError
 from logfusion.fusion import FusionEngine
 
 
-ORCHESTRATOR_CHECKPOINT_VERSION = 1
+ORCHESTRATOR_CHECKPOINT_VERSION = 2
 
 
 class OrchestratorError(ValueError):
@@ -28,6 +28,7 @@ class OrchestratorConfig:
     batch_size: int = 1_000
     watermark_lag_seconds: int = 5 * 60
     peer_groups_path: str | None = None
+    rules_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -105,7 +106,7 @@ def run_continuous_pipeline(
 
     downstream: dict[str, Any] | None = None
     if run_downstream:
-        downstream = _run_downstream(paths, watermark, settings.peer_groups_path)
+        downstream = _run_downstream(paths, watermark, settings.peer_groups_path, settings.rules_path)
     if checkpoint is not None:
         _save_checkpoint(checkpoint, input_path, paths, settings, committed_offset, max_event_time)
     return {
@@ -130,13 +131,18 @@ def _apply_batch(
             counts["rejected"] += 1
 
 
-def _run_downstream(paths: dict[str, Path], watermark: int | None, peer_groups_path: str | None = None) -> dict[str, Any]:
+def _run_downstream(
+    paths: dict[str, Path], watermark: int | None, peer_groups_path: str | None = None, rules_path: str | None = None,
+) -> dict[str, Any]:
     # Baseline keeps its own rolling cutoff. Supplying the persisted event-time
     # watermark makes repeated runs deterministic with respect to late data.
     as_of = _iso(watermark) if watermark is not None else None
     with BaselineEngine(paths["feature_state"], paths["baseline_state"], peer_groups_path=peer_groups_path) as baseline:
         baseline_report = baseline.update(as_of=as_of)
-    with DetectionEngine(paths["feature_state"], paths["baseline_state"], paths["detection_state"]) as detection:
+    with DetectionEngine(
+        paths["feature_state"], paths["baseline_state"], paths["detection_state"],
+        rules_path=Path(rules_path) if rules_path else None,
+    ) as detection:
         detection_report = detection.run()
     with CorrelationEngine(paths["feature_state"], paths["detection_state"], paths["incident_state"]) as correlation:
         correlation_report = correlation.run()

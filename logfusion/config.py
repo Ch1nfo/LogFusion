@@ -138,7 +138,7 @@ def load_fusion_policy(path: Path) -> dict[str, Any]:
         if active and ":" in stripped:
             key, value = stripped.split(":", 1)
             settings[key.strip()] = _typed_value(value)
-    for key in ("alert_threshold", "critical_threshold", "cross_system_bonus", "detector_bonus", "detector_bonus_cap", "per_user_daily_alert_limit"):
+    for key in ("alert_threshold", "critical_threshold", "cross_system_bonus", "detector_family_bonus", "detector_family_bonus_cap", "per_user_daily_alert_limit"):
         if key in settings:
             try:
                 settings[key] = int(settings[key])

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "rule_id": "sso-brute-force",
+      "version": 1,
+      "name": "SSO repeated failures",
+      "description": "Detect repeated authentication failures in five minutes.",
+      "status": "draft",
+      "scope": "window",
+      "source_types": [
+        "sso"
+      ],
+      "window_size": 300,
+      "score": 85,
+      "match": "all",
+      "conditions": [
+        {
+          "field": "failure_count",
+          "operator": "gte",
+          "value": 10
+        }
+      ],
+      "tags": [
+        "authentication"
+      ],
+      "tests": [
+        {
+          "name": "positive",
+          "input": {
+            "failure_count": 12,
+            "source_types": [
+              "sso"
+            ]
+          },
+          "expected_match": true
+        },
+        {
+          "name": "negative",
+          "input": {
+            "failure_count": 2,
+            "source_types": [
+              "sso"
+            ]
+          },
+          "expected_match": false
+        }
+      ]
+    }
+  ]
+}

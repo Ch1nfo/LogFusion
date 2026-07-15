@@ -23,6 +23,9 @@ from logfusion.llm_provider import LLMProviderError, OpenAICompatibleProvider
 from logfusion.parser_registry import ParserRegistryError, list_registry, register_candidates, set_parser_status
 from logfusion.parser_test_harness import run_registry_tests
 from logfusion.quality_drift import detect_drift
+from logfusion.project import ProjectError, init_project, load_project, project_doctor, project_status
+from logfusion.readiness import ReadinessEngine, ReadinessError
+from logfusion.rules import RuleError, load_rules, test_rules, validate_rules
 from logfusion.replay_compare import compare_raw_replays
 from logfusion.shadow_replay import run_shadow_replay
 from logfusion.streaming import CheckpointError, run_streaming_pipeline, run_streaming_raw_replay
@@ -31,6 +34,30 @@ from logfusion.streaming import CheckpointError, run_streaming_pipeline, run_str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="logfusion")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    project_parser = subparsers.add_parser("project")
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+    project_init_parser = project_subparsers.add_parser("init")
+    project_init_parser.add_argument("--root", default=".")
+    project_init_parser.add_argument("--name", default="LogFusion")
+    project_init_parser.add_argument("--force", action="store_true")
+
+    status_parser_top = subparsers.add_parser("status")
+    status_parser_top.add_argument("--project", dest="project_path")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--project", dest="project_path")
+
+    console_parser = subparsers.add_parser("console")
+    console_parser.add_argument("--project", dest="project_path")
+    console_parser.add_argument("--host")
+    console_parser.add_argument("--port", type=int)
+    console_parser.add_argument("--demo", action="store_true")
+
+    demo_parser = subparsers.add_parser("demo")
+    demo_subparsers = demo_parser.add_subparsers(dest="demo_command", required=True)
+    demo_seed_parser = demo_subparsers.add_parser("seed")
+    demo_seed_parser.add_argument("--project", dest="project_path")
+    demo_seed_parser.add_argument("--force", action="store_true")
 
     parse_parser = subparsers.add_parser("parse")
     parse_parser.add_argument("--config", required=True)
@@ -75,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     kafka_ueba_parser.add_argument("--risk-state", required=True)
     kafka_ueba_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
     kafka_ueba_parser.add_argument("--peer-groups")
+    kafka_ueba_parser.add_argument("--rules")
 
     features_parser = subparsers.add_parser("features")
     features_subparsers = features_parser.add_subparsers(dest="features_command", required=True)
@@ -101,6 +129,13 @@ def main(argv: list[str] | None = None) -> int:
     baseline_query_parser.add_argument("--user", required=True)
     baseline_query_parser.add_argument("--window-size", type=int)
 
+    rules_parser = subparsers.add_parser("rules")
+    rules_subparsers = rules_parser.add_subparsers(dest="rules_command", required=True)
+    rules_validate_parser = rules_subparsers.add_parser("validate")
+    rules_validate_parser.add_argument("--config", required=True)
+    rules_test_parser = rules_subparsers.add_parser("test")
+    rules_test_parser.add_argument("--config", required=True)
+
     detect_parser = subparsers.add_parser("detect")
     detect_subparsers = detect_parser.add_subparsers(dest="detect_command", required=True)
     detect_run_parser = detect_subparsers.add_parser("run")
@@ -108,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     detect_run_parser.add_argument("--baseline-state", required=True)
     detect_run_parser.add_argument("--state", required=True)
     detect_run_parser.add_argument("--policy-config")
+    detect_run_parser.add_argument("--rules")
+    detect_run_parser.add_argument("--refresh-rules", action="store_true")
     detect_query_parser = detect_subparsers.add_parser("query")
     detect_query_parser.add_argument("--state", required=True)
     detect_query_parser.add_argument("--user", required=True)
@@ -134,6 +171,13 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_compare_parser = evaluate_subparsers.add_parser("compare")
     evaluate_compare_parser.add_argument("--state", required=True)
     evaluate_compare_parser.add_argument("--experiment-id", action="append", required=True)
+    evaluate_readiness_parser = evaluate_subparsers.add_parser("readiness")
+    evaluate_readiness_parser.add_argument("--feature-state", required=True)
+    evaluate_readiness_parser.add_argument("--baseline-state", required=True)
+    evaluate_readiness_parser.add_argument("--case-state", required=True)
+    evaluate_readiness_parser.add_argument("--model-config")
+    evaluate_readiness_parser.add_argument("--as-of")
+    evaluate_readiness_parser.add_argument("--report-output")
 
     correlate_parser = subparsers.add_parser("correlate")
     correlate_subparsers = correlate_parser.add_subparsers(dest="correlate_command", required=True)
@@ -177,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     orchestrate_run_parser.add_argument("--watermark-lag-seconds", type=int, default=300)
     orchestrate_run_parser.add_argument("--no-downstream", action="store_true")
     orchestrate_run_parser.add_argument("--peer-groups")
+    orchestrate_run_parser.add_argument("--rules")
 
     cases_parser = subparsers.add_parser("cases")
     cases_subparsers = cases_parser.add_subparsers(dest="cases_command", required=True)
@@ -292,6 +337,33 @@ def main(argv: list[str] | None = None) -> int:
     replay_compare_parser.add_argument("--output", required=True)
 
     args = parser.parse_args(argv)
+    if args.command in {"project", "status", "doctor", "console", "demo"}:
+        try:
+            if args.command == "project":
+                project = init_project(Path(args.root), args.name, args.force)
+                report = {"project": project.name, "root": str(project.root), "config": str(project.path)}
+            else:
+                project = load_project(args.project_path)
+                if args.command == "status":
+                    report = project_status(project)
+                elif args.command == "doctor":
+                    report = project_doctor(project)
+                elif args.command == "demo":
+                    from logfusion.console import seed_demo
+
+                    report = {"demo_data": str(seed_demo(project, args.force))}
+                else:
+                    from logfusion.console import serve_console
+
+                    if args.port is not None and not 1 <= args.port <= 65535:
+                        raise ProjectError("--port must be between 1 and 65535")
+                    serve_console(project, args.host, args.port, args.demo)
+                    return 0
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 0
+        except (ProjectError, OSError, ValueError) as exc:
+            print(str(exc))
+            return 1
     if args.command == "parse":
         argument_error = _streaming_argument_error(args)
         if argument_error:
@@ -320,6 +392,15 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_consume(args)
     if args.command == "features":
         return _handle_features(args)
+    if args.command == "rules":
+        try:
+            document = load_rules(Path(args.config))
+            report = {"valid": True, "rule_count": len(validate_rules(document)["rules"])} if args.rules_command == "validate" else test_rules(document)
+        except RuleError as exc:
+            print(str(exc))
+            return 1
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if args.rules_command == "validate" or report["passed"] else 1
     if args.command == "baseline":
         return _handle_baseline(args)
     if args.command == "detect":
@@ -491,7 +572,7 @@ def _handle_consume(args: argparse.Namespace) -> int:
                 feature_state=Path(args.feature_state), baseline_state=Path(args.baseline_state),
                 detection_state=Path(args.detection_state), incident_state=Path(args.incident_state),
                 risk_state=Path(args.risk_state),
-                orchestrator_config=OrchestratorConfig(watermark_lag_seconds=args.watermark_lag_seconds, peer_groups_path=args.peer_groups),
+                orchestrator_config=OrchestratorConfig(watermark_lag_seconds=args.watermark_lag_seconds, peer_groups_path=args.peer_groups, rules_path=args.rules),
                 **common,
             )
     except (CheckpointError, KafkaConsumerError, ValueError) as exc:
@@ -540,13 +621,16 @@ def _handle_detect(args: argparse.Namespace) -> int:
     try:
         if args.detect_command == "run":
             settings = load_detection_policy(Path(args.policy_config)) if args.policy_config else {}
-            with DetectionEngine(Path(args.feature_state), Path(args.baseline_state), Path(args.state), DetectionConfig(**settings)) as engine:
-                report = engine.run()
+            with DetectionEngine(
+                Path(args.feature_state), Path(args.baseline_state), Path(args.state), DetectionConfig(**settings),
+                Path(args.rules) if args.rules else None,
+            ) as engine:
+                report = engine.run(refresh_rules=args.refresh_rules)
         elif args.detect_command == "query":
             report = query_detection_state(Path(args.state), args.user, args.from_time, args.to_time)
         else:
             return 2
-    except DetectionError as exc:
+    except (DetectionError, RuleError) as exc:
         print(str(exc))
         return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -577,9 +661,18 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             if len(args.experiment_id) != 2:
                 raise EvaluationError("evaluate compare requires exactly two --experiment-id values")
             report = compare_evaluation_state(Path(args.state), args.experiment_id[0], args.experiment_id[1])
+        elif args.evaluate_command == "readiness":
+            model_settings = load_model_detection_config(Path(args.model_config)) if args.model_config else {}
+            with ReadinessEngine(
+                Path(args.feature_state), Path(args.baseline_state), Path(args.case_state),
+                ModelDetectionConfig(**model_settings),
+            ) as engine:
+                report = engine.report(args.as_of)
+            if args.report_output:
+                _write_json(Path(args.report_output), report)
         else:
             return 2
-    except (EvaluationError, ValueError) as exc:
+    except (EvaluationError, ReadinessError, ValueError) as exc:
         print(str(exc))
         return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -631,10 +724,10 @@ def _handle_orchestrate(args: argparse.Namespace) -> int:
             args.incident_state, args.risk_state,
             checkpoint_path=args.checkpoint,
             resume=args.resume,
-            config=OrchestratorConfig(args.batch_size, args.watermark_lag_seconds, args.peer_groups),
+            config=OrchestratorConfig(args.batch_size, args.watermark_lag_seconds, args.peer_groups, args.rules),
             run_downstream=not args.no_downstream,
         )
-    except (OrchestratorError, FeatureError) as exc:
+    except (OrchestratorError, FeatureError, DetectionError, RuleError) as exc:
         print(str(exc))
         return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))

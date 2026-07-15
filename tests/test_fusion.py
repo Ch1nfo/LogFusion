@@ -30,6 +30,7 @@ def test_fuses_incidents_into_explainable_risk_and_alerts(tmp_path):
     assessment = max(result["assessments"], key=lambda row: row["risk_score"])
     assert assessment["risk_score"] >= assessment["base_score"]
     assert assessment["risk_breakdown"]["cross_system_bonus"] == 10
+    assert assessment["risk_breakdown"]["detector_family_diversity_bonus"] == 0
     assert result["alerts"]
 
 

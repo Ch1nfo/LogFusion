@@ -61,3 +61,19 @@ def test_evaluate_cli_rejects_invalid_model_configuration(tmp_path, capsys):
         "--model-config", str(config), "--name", "invalid", "--from", "2026-01-01T00:00:00Z", "--to", "2026-01-02T00:00:00Z",
     ]) == 1
     assert "threshold_quantile" in capsys.readouterr().out
+
+
+def test_evaluate_readiness_cli_writes_report(tmp_path, capsys):
+    feature_db, baseline_db, case_db = tmp_path / "features.db", tmp_path / "baseline.db", tmp_path / "cases.db"
+    as_of = _seed_ready(feature_db, include_outlier=True)
+    with BaselineEngine(feature_db, baseline_db) as baseline:
+        baseline.update(as_of)
+    _case_state(case_db)
+    output = tmp_path / "readiness.json"
+    assert main([
+        "evaluate", "readiness", "--feature-state", str(feature_db), "--baseline-state", str(baseline_db),
+        "--case-state", str(case_db), "--report-output", str(output),
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["history"]["missing_days"] == 9
+    assert json.loads(output.read_text(encoding="utf-8"))["as_of"] == report["as_of"]
