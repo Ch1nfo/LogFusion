@@ -286,7 +286,9 @@ conda run -n agent python -m logfusion fuse query \
   --to 2026-07-02T00:00:00Z
 ```
 
-首版风险分为 Incident 聚合分，加上跨来源系统奖励 10 分，以及每多一种检测 family 3 分（总计最多 10 分），最高 100 分。同一 family 内多个检测器不会重复获得 diversity bonus。`80+` 进入告警策略、`90+` 为 `critical`；每个用户每天默认最多产生 3 条告警，超过预算的高风险评估保留为 `suppressed_budget`，低于门槛的保留为 `below_threshold`。输入 revision 更新时，旧风险评估和告警标记为 `superseded`，新版本保留明确的替代链。该模块尚不引入资产、部门、身份图谱或外部 SOC 推送。
+首版风险分为 Incident 聚合分，加上跨来源系统奖励 10 分，以及每多一种检测 family 3 分（总计最多 10 分），最高 100 分。同一 family 内多个检测器不会重复获得 diversity bonus。`80+` 进入告警策略、`90+` 为 `critical`；每个用户每天默认最多产生 3 条告警，超过预算的高风险评估保留为 `suppressed_budget`，低于门槛的保留为 `below_threshold`。输入 revision 更新时，旧风险评估和告警标记为 `superseded`，新版本保留明确的替代链。
+
+外部告警出口的目标流程固定为 `Risk Alert → Kafka Topic → 安全运营中心消费`。当前只保留这一架构边界，不创建 Producer、Topic、消息 Schema、重试或认证配置；待安全运营中心的 Kafka 接入约束确定后再实现。
 
 风险策略可通过本地 YAML 调整；策略指纹受 Risk DB 保护，改变后需重建 Risk DB，避免静默改变历史告警语义：
 
