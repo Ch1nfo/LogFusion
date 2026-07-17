@@ -12,6 +12,7 @@ from typing import Any, Iterator
 CASE_SCHEMA_VERSION = "3"
 FUSION_SCHEMA_VERSION = "2"
 CASE_STATUSES = ("new", "acknowledged", "investigating", "resolved", "false_positive", "suppressed")
+CASE_SEVERITIES = ("low", "medium", "high", "critical")
 TERMINAL_CASE_STATUSES = {"resolved", "false_positive"}
 
 
@@ -38,8 +39,30 @@ class CaseEngine:
         self._create_schema()
         self._initialize_meta()
 
+    @classmethod
+    def for_operations(cls, case_state: Path | str) -> "CaseEngine":
+        """Open an existing Case DB for analyst operations without requiring Risk DB availability."""
+        path = Path(case_state)
+        if not path.exists():
+            raise CaseError(f"case state does not exist: {path}")
+        engine = object.__new__(cls)
+        engine.risk_path = None
+        engine.case_path = path
+        engine.risk = None
+        engine.connection = sqlite3.connect(path)
+        engine.connection.row_factory = sqlite3.Row
+        engine.connection.execute("PRAGMA journal_mode = WAL")
+        engine.connection.execute("PRAGMA synchronous = NORMAL")
+        engine.connection.execute("PRAGMA busy_timeout = 5000")
+        meta = _meta_map(engine.connection, "case_meta")
+        if meta.get("case_schema_version") != CASE_SCHEMA_VERSION:
+            engine.connection.close()
+            raise CaseError("case schema version changed; rebuild Case DB")
+        return engine
+
     def close(self) -> None:
-        self.risk.close()
+        if self.risk is not None:
+            self.risk.close()
         self.connection.close()
 
     def __enter__(self) -> CaseEngine:
@@ -292,6 +315,78 @@ def list_cases(case_state: Path | str, user_name: str | None = None, status: str
         connection.close()
 
 
+def search_cases(
+    case_state: Path | str,
+    *,
+    user_name: str | None = None,
+    status: str | None = None,
+    severity: str | None = None,
+    owner: str | None = None,
+    requires_review: bool | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    path = Path(case_state)
+    if not path.exists():
+        raise CaseError(f"case state does not exist: {path}")
+    if status is not None and status not in CASE_STATUSES:
+        raise CaseError(f"unsupported case status: {status}")
+    if severity is not None and severity not in CASE_SEVERITIES:
+        raise CaseError(f"unsupported case severity: {severity}")
+    if page < 1 or page_size < 1 or page_size > 200:
+        raise CaseError("invalid case pagination")
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        meta = _meta_map(connection, "case_meta")
+        if meta.get("case_schema_version") != CASE_SCHEMA_VERSION:
+            raise CaseError("case schema version changed; rebuild Case DB")
+        clauses, params = ["1 = 1"], []
+        if user_name:
+            clauses.append("user_name LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(user_name.strip())}%")
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if owner == "__unassigned__":
+            clauses.append("owner IS NULL")
+        elif owner:
+            clauses.append("owner = ?")
+            params.append(owner.strip())
+        if requires_review is not None:
+            clauses.append("requires_review = ?")
+            params.append(int(requires_review))
+        where = " AND ".join(clauses)
+        total = int(connection.execute(f"SELECT COUNT(*) FROM cases WHERE {where}", params).fetchone()[0])
+        rows = connection.execute(
+            f"SELECT * FROM cases WHERE {where} ORDER BY requires_review DESC,risk_score DESC,last_seen DESC,case_id LIMIT ? OFFSET ?",
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+        by_status = {item: 0 for item in CASE_STATUSES}
+        for row in connection.execute("SELECT status,COUNT(*) count FROM cases GROUP BY status"):
+            by_status[row["status"]] = int(row["count"])
+        summary_row = connection.execute(
+            "SELECT COUNT(*) total,SUM(owner IS NULL) unassigned,SUM(requires_review = 1) review FROM cases"
+        ).fetchone()
+        return {
+            "items": [_serialize_case(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "summary": {
+                "total": int(summary_row["total"] or 0),
+                "unassigned": int(summary_row["unassigned"] or 0),
+                "requires_review": int(summary_row["review"] or 0),
+                "by_status": by_status,
+            },
+        }
+    finally:
+        connection.close()
+
+
 def get_case(case_state: Path | str, case_id: str) -> dict[str, Any]:
     path = Path(case_state)
     if not path.exists():
@@ -360,3 +455,7 @@ def _serialize_event(row: sqlite3.Row) -> dict[str, Any]:
     result["created_at"] = _iso(result["created_at"])
     result["details"] = json.loads(result.pop("details_json"))
     return result
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

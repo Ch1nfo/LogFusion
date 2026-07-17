@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+
 from logfusion.baseline import BaselineEngine
-from logfusion.cases import CaseEngine, CaseError, get_case, list_cases
+from logfusion.cases import CaseEngine, CaseError, get_case, list_cases, search_cases
 from logfusion.correlation import CorrelationEngine
 from logfusion.detection import DetectionEngine
 from logfusion.features import FeatureEngine
@@ -47,6 +49,9 @@ def test_case_sync_preserves_analyst_state_across_fusion_alert_versions(tmp_path
     assert any(event["event_type"] == "risk_alert_refreshed" for event in refreshed["events"])
     assert get_case(case_db, case_id)["owner"] == "alice"
     assert list_cases(case_db, status="false_positive")
+    with CaseEngine.for_operations(case_db) as cases:
+        reopened = cases.transition(case_id, "investigating", "analyst-1", "reviewing new alert revision")
+    assert reopened["requires_review"] is False
 
 
 def test_case_suppression_requires_future_expiry_and_is_audited(tmp_path):
@@ -97,3 +102,39 @@ def test_case_state_does_not_create_model_training_disposition(tmp_path):
         result = cases.get(case_id)
         assert "disposition" not in result
         assert result["status"] == "new"
+
+
+def test_case_search_filters_summarizes_and_paginates(tmp_path):
+    _, _, detection_db, incident_db, risk_db = _seed_incidents(tmp_path)
+    with FusionEngine(detection_db, incident_db, risk_db) as fusion:
+        fusion.run()
+    case_db = tmp_path / "cases.db"
+    with CaseEngine(risk_db, case_db) as cases:
+        cases.sync()
+        initial = cases.list()
+        original = initial[0]
+        cases.assign(original["case_id"], "alice", "analyst")
+    connection = sqlite3.connect(case_db)
+    row = connection.execute("SELECT * FROM cases LIMIT 1").fetchone()
+    columns = [item[1] for item in connection.execute("PRAGMA table_info(cases)")]
+    placeholders = ",".join("?" for _ in columns)
+    for index in range(51):
+        values = list(row)
+        values[columns.index("case_id")] = f"clone-{index}"
+        values[columns.index("alert_key")] = f"alert-key-{index}"
+        values[columns.index("current_alert_id")] = f"alert-{index}"
+        values[columns.index("user_name")] = f"clone-user-{index}"
+        values[columns.index("owner")] = None
+        values[columns.index("requires_review")] = int(index == 0)
+        connection.execute(f"INSERT INTO cases({','.join(columns)}) VALUES ({placeholders})", values)
+    connection.commit()
+    connection.close()
+
+    first = search_cases(case_db, page=1)
+    second = search_cases(case_db, page=2)
+    filtered = search_cases(case_db, owner="alice", requires_review=False)
+    assert first["total"] == len(initial) + 51 and len(first["items"]) == 50
+    assert len(second["items"]) == len(initial) + 1
+    assert first["items"][0]["requires_review"] is True
+    assert first["summary"]["unassigned"] == len(initial) + 50
+    assert filtered["total"] == 1 and filtered["items"][0]["owner"] == "alice"

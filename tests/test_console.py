@@ -4,8 +4,11 @@ from io import BytesIO
 import json
 from urllib.parse import urlencode
 
+from logfusion.cases import CaseEngine
 from logfusion.console import ConsoleApp, JobStore, build_job_command, seed_demo
+from logfusion.fusion import FusionEngine
 from logfusion.project import init_project
+from tests.test_fusion import _seed_incidents
 
 
 SSO_SAMPLE = json.dumps({
@@ -15,11 +18,14 @@ SSO_SAMPLE = json.dumps({
 })
 
 
-def _request(app, path: str, method: str = "GET", form: dict[str, str] | None = None):
+def _request(app, path: str, method: str = "GET", form: dict[str, str] | None = None, cookie: str = ""):
     body = urlencode(form or {}).encode()
+    path_info, _, query = path.partition("?")
     environ = {
         "REQUEST_METHOD": method,
-        "PATH_INFO": path,
+        "PATH_INFO": path_info,
+        "QUERY_STRING": query,
+        "HTTP_COOKIE": cookie,
         "CONTENT_LENGTH": str(len(body)),
         "CONTENT_TYPE": "application/x-www-form-urlencoded",
         "wsgi.input": BytesIO(body),
@@ -90,6 +96,10 @@ def test_demo_console_renders_core_pages_and_is_read_only(tmp_path):
     assert "日波动 CV" in experiments and "Precision" not in experiments
     readiness = _request(app, "/readiness")["body"]
     assert "训练数据未就绪" in readiness and "Benign" not in readiness
+    detail = _request(app, "/cases/demo-case-1")
+    assert detail["status"] == "200 OK"
+    assert "Candidate 时间线" in detail["body"] and "kafka://security-log/2/9182" in detail["body"]
+    assert "raw_text" not in detail["body"]
 
 
 def _rule_form(token: str) -> dict[str, str]:
@@ -201,3 +211,70 @@ def test_console_parse_job_is_allowlisted(tmp_path):
     command = build_job_command(project, "parse", {})
     assert command[2:5] == ["logfusion", "parse", "--config"]
     assert command[-2:] == ["--checkpoint", str(tmp_path / "output/parse.checkpoint.json")]
+
+
+def test_case_workbench_filters_details_and_performs_audited_actions(tmp_path):
+    project = init_project(tmp_path)
+    output = tmp_path / "output"
+    _, _, detection_db, incident_db, risk_db = _seed_incidents(output)
+    with FusionEngine(detection_db, incident_db, risk_db) as fusion:
+        fusion.run()
+    case_db = output / "cases.db"
+    with CaseEngine(risk_db, case_db) as cases:
+        cases.sync()
+        case_id = cases.list()[0]["case_id"]
+    app = ConsoleApp(project)
+
+    listed = _request(app, "/cases?status=new&review=no")
+    assert listed["status"] == "200 OK" and f"/cases/{case_id}" in listed["body"]
+    detail = _request(app, f"/cases/{case_id}")
+    assert detail["status"] == "200 OK"
+    assert "当前检测链" in detail["body"] and "Evidence 引用" in detail["body"]
+
+    assigned = _request(app, f"/cases/{case_id}/assign", "POST", {
+        "csrf": app.csrf_token, "actor": "王分析员", "owner": "alice", "note": "接手调查",
+    })
+    assert assigned["status"] == "303 See Other"
+    assert "logfusion_actor=" in assigned["headers"]["Set-Cookie"]
+    assert "HttpOnly" in assigned["headers"]["Set-Cookie"] and "SameSite=Lax" in assigned["headers"]["Set-Cookie"]
+    actor_cookie = assigned["headers"]["Set-Cookie"].split(";", 1)[0]
+    remembered = _request(app, f"/cases/{case_id}", cookie=actor_cookie)
+    assert "王分析员" in remembered["body"]
+
+    invalid_comment = _request(app, f"/cases/{case_id}/comment", "POST", {
+        "csrf": app.csrf_token, "actor": "王分析员", "note": "x" * 4001,
+    })
+    assert invalid_comment["status"] == "400 Bad Request" and "1-4000" in invalid_comment["body"]
+
+    commented = _request(app, f"/cases/{case_id}/comment", "POST", {
+        "csrf": app.csrf_token, "actor": "王分析员", "note": "已检查 Evidence 引用",
+    })
+    assert commented["status"] == "303 See Other"
+    tagged = _request(app, f"/cases/{case_id}/tags", "POST", {
+        "csrf": app.csrf_token, "actor": "王分析员", "tags": "ueba, review,ueba",
+    })
+    assert tagged["status"] == "303 See Other"
+    transitioned = _request(app, f"/cases/{case_id}/transition", "POST", {
+        "csrf": app.csrf_token, "actor": "王分析员", "status": "suppressed", "suppression_duration": "1h", "suppression_custom": "", "note": "短时抑制",
+    })
+    assert transitioned["status"] == "303 See Other"
+    with CaseEngine.for_operations(case_db) as cases:
+        result = cases.get(case_id)
+    assert result["owner"] == "alice" and result["tags"] == ["review", "ueba"]
+    assert result["status"] == "suppressed" and result["suppression_until"] is not None
+    assert any(event["event_type"] == "comment" for event in result["events"])
+
+
+def test_case_workbench_rejects_csrf_invalid_comment_and_demo_write(tmp_path):
+    project = init_project(tmp_path)
+    seed_demo(project)
+    demo = ConsoleApp(project, demo=True)
+    rejected = _request(demo, "/cases/demo-case-1/comment", "POST", {
+        "csrf": demo.csrf_token, "actor": "alice", "note": "cannot write",
+    })
+    assert rejected["status"] == "400 Bad Request" and "read-only" in rejected["body"]
+
+    bad_csrf = _request(demo, "/cases/demo-case-1/comment", "POST", {
+        "csrf": "wrong", "actor": "alice", "note": "x",
+    })
+    assert bad_csrf["status"] == "400 Bad Request" and "CSRF" in bad_csrf["body"]

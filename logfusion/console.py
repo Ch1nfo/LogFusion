@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -10,18 +11,20 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from wsgiref.simple_server import WSGIServer, make_server
 
-from logfusion.cases import CaseError, list_cases
+from logfusion.cases import CASE_STATUSES, CaseEngine, CaseError, search_cases
 from logfusion.config import load_kafka_config, load_sources_config
 from logfusion.project import ProjectConfig, project_status
+from logfusion.investigation import get_case_investigation
 from logfusion.source_management import (
     SourceManagementError,
     add_kafka_source,
@@ -209,7 +212,9 @@ class ConsoleApp:
             if method == "GET" and path == "/experiments":
                 return self._html(start_response, self._experiments())
             if method == "GET" and path == "/cases":
-                return self._html(start_response, self._cases())
+                return self._html(start_response, self._cases(environ))
+            if method == "GET" and path.startswith("/cases/"):
+                return self._html(start_response, self._case_detail(environ, self._case_id(path)))
             if method == "GET" and path == "/rules":
                 return self._html(start_response, self._rules())
             if method == "GET" and path == "/rules/new":
@@ -234,6 +239,8 @@ class ConsoleApp:
                 return self._import_rule(environ, start_response)
             if method == "POST" and path == "/rules/status":
                 return self._set_rule_status(environ, start_response)
+            if method == "POST" and path.startswith("/cases/"):
+                return self._case_action(environ, start_response, path)
             return self._html(start_response, _layout("未找到", "", "<section class='panel'><h1>页面不存在</h1></section>", self.demo), "404 Not Found")
         except (ConsoleError, SourceManagementError, RuleError) as exc:
             return self._html(start_response, _layout("请求失败", "", f"<section class='panel'><h1>请求失败</h1><p>{_e(exc)}</p></section>", self.demo), "400 Bad Request")
@@ -364,13 +371,123 @@ class ConsoleApp:
         body += "<section class='panel'>" + _table(["实验", "检测器", "Candidate", "异常用户", "每日预测", "日波动 CV", "起始时间"], rows, "尚无实验") + "</section>"
         return _layout("检测实验", "experiments", body, self.demo)
 
-    def _cases(self) -> str:
-        cases = self.demo_data["cases"] if self.demo_data else self._case_data()
-        rows = [[item.get("user_name", "—"), item.get("status", "—"), item.get("severity", "—"), item.get("risk_score", "—"), item.get("owner") or "—", item.get("last_seen", "—")] for item in cases]
+    def _cases(self, environ: dict[str, Any]) -> str:
+        filters = self._case_filters(environ)
+        page = int(filters.pop("page"))
+        if self.demo_data:
+            document = _search_demo_cases(self.demo_data["cases"], filters, page)
+        else:
+            case_path = self.project.state("case")
+            document = search_cases(case_path, **filters, page=page) if case_path.exists() else _empty_case_search(page)
+        summary = document["summary"]
+        cards = "<section class='cards'>" + "".join((
+            _card("全部 Case", summary["total"], "本地审计状态"),
+            _card("待复核", summary["requires_review"], "告警版本已更新"),
+            _card("未分配", summary["unassigned"], "尚无负责人"),
+            _card("筛选结果", document["total"], f"第 {document['page']} 页"),
+        )) + "</section>"
+        filter_form = _case_filter_form(filters)
+        rows = []
+        for item in document["items"]:
+            review = "<span class='review-flag'>待复核</span>" if item.get("requires_review") else "—"
+            rows.append([
+                f"<a href='/cases/{_e(item['case_id'])}'>{_e(item.get('user_name', '—'))}</a>",
+                f"<span class='status {_e(item.get('status', ''))}'>{_e(item.get('status', '—'))}</span>",
+                _e(item.get("severity", "—")), _e(item.get("risk_score", "—")), _e(item.get("owner") or "未分配"),
+                _e(", ".join(item.get("tags", [])) or "—"), review, _e(item.get("last_seen", "—")),
+            ])
         body = "<header class='page-head'><div><p class='eyebrow'>INVESTIGATION</p><h1>Cases</h1><p>Case 只服务调查、处置和审计，不产生模型训练标签。</p></div></header>"
-        body += "<section class='panel'>" + _table(["用户", "状态", "严重度", "风险分", "负责人", "最后出现"], rows, "尚无 Case") + "</section>"
-        body += "<section class='notice'><strong>下一阶段</strong><span>证据时间线、评论、负责人和处置状态操作。</span></section>"
+        body += cards + filter_form
+        body += "<section class='panel'>" + _raw_table(["用户", "状态", "严重度", "风险分", "负责人", "标签", "复核", "最后出现"], rows, "尚无 Case") + _case_pagination(document, filters) + "</section>"
         return _layout("Cases", "cases", body, self.demo)
+
+    def _case_detail(self, environ: dict[str, Any], case_id: str, error: str | None = None) -> str:
+        actor = self._actor(environ)
+        if self.demo_data:
+            investigation = _demo_investigation(self.demo_data, case_id)
+        else:
+            investigation = get_case_investigation(
+                self.project.state("case"), self.project.state("risk"), self.project.state("incident"),
+                self.project.state("detection"), case_id,
+            )
+        return _case_detail_page(investigation, self.csrf_token, actor, self.demo, error)
+
+    def _case_action(
+        self, environ: dict[str, Any], start_response: Callable[..., Any], path: str,
+    ) -> Iterable[bytes]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[0] != "cases" or parts[2] not in {"transition", "assign", "comment", "tags"}:
+            raise ConsoleError("invalid Case action")
+        case_id, action = self._validated_case_id(parts[1]), parts[2]
+        form = self._form(environ)
+        actor = _one(form, "actor").strip()
+        try:
+            self._authorize(form)
+            self._ensure_real()
+            if not actor or len(actor) > 80:
+                raise ConsoleError("分析员名称必须为 1-80 个字符")
+            with CaseEngine.for_operations(self.project.state("case")) as engine:
+                if action == "transition":
+                    status = _one(form, "status")
+                    suppression_until = _suppression_until(status, _one(form, "suppression_duration"), _one(form, "suppression_custom"))
+                    engine.transition(case_id, status, actor, _one(form, "note").strip() or None, suppression_until)
+                elif action == "assign":
+                    engine.assign(case_id, _one(form, "owner"), actor, _one(form, "note").strip() or None)
+                elif action == "comment":
+                    note = _one(form, "note").strip()
+                    if not note or len(note) > 4000:
+                        raise ConsoleError("评论必须为 1-4000 个字符")
+                    engine.comment(case_id, actor, note)
+                else:
+                    tags = [item.strip() for item in _one(form, "tags").split(",") if item.strip()]
+                    engine.set_tags(case_id, tags, actor)
+            cookie = f"logfusion_actor={quote(actor, safe='')}; Max-Age=2592000; Path=/; HttpOnly; SameSite=Lax"
+            return self._redirect(start_response, f"/cases/{case_id}?updated={action}", [("Set-Cookie", cookie)])
+        except (CaseError, ConsoleError) as exc:
+            retry_environ = dict(environ)
+            if actor:
+                retry_environ["HTTP_COOKIE"] = f"logfusion_actor={quote(actor, safe='')}"
+            return self._html(start_response, self._case_detail(retry_environ, case_id, str(exc)), "400 Bad Request")
+
+    def _case_filters(self, environ: dict[str, Any]) -> dict[str, Any]:
+        query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=False)
+        page_value = _query_one(query, "page") or "1"
+        if not page_value.isdigit() or int(page_value) < 1:
+            raise ConsoleError("invalid Case page")
+        status = _query_one(query, "status") or None
+        severity = _query_one(query, "severity") or None
+        review_value = _query_one(query, "review")
+        if review_value not in {"", "yes", "no"}:
+            raise ConsoleError("invalid Case review filter")
+        return {
+            "user_name": (_query_one(query, "user") or "").strip() or None,
+            "status": status,
+            "severity": severity,
+            "owner": (_query_one(query, "owner") or "").strip() or None,
+            "requires_review": True if review_value == "yes" else (False if review_value == "no" else None),
+            "page": int(page_value),
+        }
+
+    def _case_id(self, path: str) -> str:
+        parts = path.strip("/").split("/")
+        if len(parts) != 2 or parts[0] != "cases":
+            raise ConsoleError("invalid Case path")
+        return self._validated_case_id(parts[1])
+
+    @staticmethod
+    def _validated_case_id(value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+            raise ConsoleError("invalid Case ID")
+        return value
+
+    @staticmethod
+    def _actor(environ: dict[str, Any]) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(environ.get("HTTP_COOKIE", ""))
+            return unquote(cookie["logfusion_actor"].value)[:80] if "logfusion_actor" in cookie else ""
+        except (CookieError, UnicodeDecodeError):
+            return ""
 
     def _submit_readiness(self, environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
         form = self._form(environ)
@@ -525,12 +642,6 @@ class ConsoleApp:
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def _case_data(self) -> list[dict[str, Any]]:
-        try:
-            return list_cases(self.project.state("case")) if self.project.state("case").exists() else []
-        except CaseError:
-            return []
-
     @staticmethod
     def _html(start_response: Callable[..., Any], body: str, status: str = "200 OK") -> Iterable[bytes]:
         encoded = body.encode("utf-8")
@@ -544,8 +655,8 @@ class ConsoleApp:
         return [encoded]
 
     @staticmethod
-    def _redirect(start_response: Callable[..., Any], location: str) -> Iterable[bytes]:
-        start_response("303 See Other", [("Location", location), *(_headers("text/plain; charset=utf-8", 0))])
+    def _redirect(start_response: Callable[..., Any], location: str, extra_headers: list[tuple[str, str]] | None = None) -> Iterable[bytes]:
+        start_response("303 See Other", [("Location", location), *(extra_headers or []), *(_headers("text/plain; charset=utf-8", 0))])
         return [b""]
 
 
@@ -674,10 +785,10 @@ def _demo_document() -> dict[str, Any]:
             {"name": "iforest-demo", "detector_id": "isolation_forest", "from": "2026-06-01", "metrics": {"candidate_count": 131, "unique_predicted_users": 31, "average_daily_predictions": 15.3, "daily_prediction_cv": 0.28}},
         ],
         "cases": [
-            {"user_name": "wangkun78", "status": "investigating", "severity": "critical", "risk_score": 94, "owner": "alice", "last_seen": "2026-07-13T11:35:00Z"},
-            {"user_name": "ops-admin", "status": "new", "severity": "high", "risk_score": 86, "owner": None, "last_seen": "2026-07-13T09:10:00Z"},
-            {"user_name": "lihua", "status": "resolved", "severity": "high", "risk_score": 82, "owner": "bob", "last_seen": "2026-07-12T18:45:00Z"},
-            {"user_name": "zhangsan", "status": "false_positive", "severity": "high", "risk_score": 80, "owner": "alice", "last_seen": "2026-07-12T03:22:00Z"},
+            {"case_id": "demo-case-1", "current_alert_id": "alert-demo-1", "incident_id": "incident-demo-1", "user_name": "wangkun78", "status": "investigating", "severity": "critical", "risk_score": 94, "owner": "alice", "tags": ["privileged", "cross-system"], "requires_review": True, "suppression_until": None, "first_seen": "2026-07-13T10:55:00Z", "last_seen": "2026-07-13T11:35:00Z"},
+            {"case_id": "demo-case-2", "current_alert_id": "alert-demo-2", "incident_id": "incident-demo-2", "user_name": "ops-admin", "status": "new", "severity": "high", "risk_score": 86, "owner": None, "tags": ["authentication"], "requires_review": False, "suppression_until": None, "first_seen": "2026-07-13T08:40:00Z", "last_seen": "2026-07-13T09:10:00Z"},
+            {"case_id": "demo-case-3", "current_alert_id": "alert-demo-3", "incident_id": "incident-demo-3", "user_name": "lihua", "status": "resolved", "severity": "high", "risk_score": 82, "owner": "bob", "tags": ["repository"], "requires_review": False, "suppression_until": None, "first_seen": "2026-07-12T18:05:00Z", "last_seen": "2026-07-12T18:45:00Z"},
+            {"case_id": "demo-case-4", "current_alert_id": "alert-demo-4", "incident_id": "incident-demo-4", "user_name": "zhangsan", "status": "false_positive", "severity": "high", "risk_score": 80, "owner": "alice", "tags": ["automation"], "requires_review": False, "suppression_until": None, "first_seen": "2026-07-12T02:58:00Z", "last_seen": "2026-07-12T03:22:00Z"},
         ],
     }
 
@@ -721,6 +832,200 @@ def _experiment_data(project: ProjectConfig) -> list[dict[str, Any]]:
         return result
     except sqlite3.Error:
         return []
+
+
+def _empty_case_search(page: int = 1) -> dict[str, Any]:
+    return {
+        "items": [], "total": 0, "page": page, "page_size": 50,
+        "summary": {"total": 0, "unassigned": 0, "requires_review": 0, "by_status": {item: 0 for item in CASE_STATUSES}},
+    }
+
+
+def _search_demo_cases(items: list[dict[str, Any]], filters: dict[str, Any], page: int) -> dict[str, Any]:
+    selected = list(items)
+    if filters.get("user_name"):
+        needle = filters["user_name"].lower()
+        selected = [item for item in selected if needle in item.get("user_name", "").lower()]
+    for field in ("status", "severity"):
+        if filters.get(field):
+            selected = [item for item in selected if item.get(field) == filters[field]]
+    if filters.get("owner") == "__unassigned__":
+        selected = [item for item in selected if not item.get("owner")]
+    elif filters.get("owner"):
+        selected = [item for item in selected if item.get("owner") == filters["owner"]]
+    if filters.get("requires_review") is not None:
+        selected = [item for item in selected if bool(item.get("requires_review")) is filters["requires_review"]]
+    selected.sort(key=lambda item: (not bool(item.get("requires_review")), -int(item.get("risk_score", 0)), item.get("last_seen", "")), reverse=False)
+    by_status = {status: sum(item.get("status") == status for item in items) for status in CASE_STATUSES}
+    return {
+        "items": selected[(page - 1) * 50:page * 50], "total": len(selected), "page": page, "page_size": 50,
+        "summary": {
+            "total": len(items), "unassigned": sum(not item.get("owner") for item in items),
+            "requires_review": sum(bool(item.get("requires_review")) for item in items), "by_status": by_status,
+        },
+    }
+
+
+def _case_filter_form(filters: dict[str, Any]) -> str:
+    status = filters.get("status") or ""
+    severity = filters.get("severity") or ""
+    owner = filters.get("owner") or ""
+    review = "yes" if filters.get("requires_review") is True else ("no" if filters.get("requires_review") is False else "")
+    return f"""<section class='panel'><form class='case-filters' method='get' action='/cases'>
+<label>用户<input name='user' value='{_e(filters.get('user_name') or '')}' placeholder='用户名包含'></label>
+<label>状态<select name='status'>{_option('', '全部', status)}{''.join(_option(item,item,status) for item in CASE_STATUSES)}</select></label>
+<label>严重度<select name='severity'>{_option('', '全部', severity)}{''.join(_option(item,item,severity) for item in ('low','medium','high','critical'))}</select></label>
+<label>负责人<input name='owner' value='{_e(owner)}' placeholder='姓名或 __unassigned__'></label>
+<label>待复核<select name='review'>{_option('', '全部', review)}{_option('yes','是',review)}{_option('no','否',review)}</select></label>
+<button class='button' type='submit'>筛选</button><a class='button secondary compact' href='/cases'>清除</a>
+</form></section>"""
+
+
+def _case_pagination(document: dict[str, Any], filters: dict[str, Any]) -> str:
+    page, page_size, total = int(document["page"]), int(document["page_size"]), int(document["total"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    if pages <= 1:
+        return ""
+    query = {
+        "user": filters.get("user_name") or "", "status": filters.get("status") or "",
+        "severity": filters.get("severity") or "", "owner": filters.get("owner") or "",
+        "review": "yes" if filters.get("requires_review") is True else ("no" if filters.get("requires_review") is False else ""),
+    }
+    links = []
+    if page > 1:
+        links.append(f"<a href='/cases?{_e(urlencode({**query, 'page': page - 1}))}'>上一页</a>")
+    links.append(f"<span>第 {page}/{pages} 页</span>")
+    if page < pages:
+        links.append(f"<a href='/cases?{_e(urlencode({**query, 'page': page + 1}))}'>下一页</a>")
+    return "<nav class='pagination' aria-label='Case 分页'>" + "".join(links) + "</nav>"
+
+
+def _demo_investigation(document: dict[str, Any], case_id: str) -> dict[str, Any]:
+    case = next((item for item in document["cases"] if item["case_id"] == case_id), None)
+    if case is None:
+        raise CaseError(f"case does not exist: {case_id}")
+    case = {**case, "events": [
+        {"event_id": 1, "event_type": "created", "actor": "system", "created_at": case["first_seen"], "details": {"alert_id": case["current_alert_id"]}},
+        {"event_id": 2, "event_type": "owner_changed", "actor": "alice", "created_at": case["last_seen"], "details": {"from": None, "to": case.get("owner")}},
+    ]}
+    candidate_id = f"candidate-{case_id}"
+    evidence = [{
+        "candidate_id": candidate_id, "evidence_order": 1, "event_id": "event-demo-001",
+        "event_time": case["first_seen"], "record_id": "record-demo-001", "source_id": "sso-main",
+        "source_type": "sso", "storage_ref": "kafka://security-log/2/9182", "checksum": "sha256:demo",
+        "reason": "authentication failure burst",
+    }]
+    return {
+        "case": case,
+        "alert": {"alert_id": case["current_alert_id"], "assessment_id": "assessment-demo-1", "risk_score": case["risk_score"], "severity": case["severity"], "policy_reason": "threshold_and_budget", "first_seen": case["first_seen"], "last_seen": case["last_seen"]},
+        "assessment": {"assessment_id": "assessment-demo-1", "base_score": 88, "risk_score": case["risk_score"], "policy_action": "alert", "risk_breakdown": {"base": 88, "cross_system_bonus": 6}},
+        "incident": {"incident_id": case["incident_id"], "incident_type": "compound_behavior_anomaly", "aggregation_score": 91, "severity": "high", "detector_families": ["rule", "statistical"], "source_types": ["sso", "gitlab"], "source_ips": ["10.20.4.17"], "resources": ["repository:finance"], "candidate_count": 1},
+        "candidates": [{
+            "candidate_id": candidate_id, "detector_family": "rule", "detector_id": "sso-brute-force", "detector_version": "1",
+            "detector_mode": "active", "score": 91, "severity": "high", "window_start": case["first_seen"], "window_end": case["last_seen"],
+            "feature_revision": 42, "baseline_revision": 12, "explanation": {"condition": "failure_count >= 10", "observed": 17},
+            "evidence_query": {"event_count": 17, "evidence_truncated": True}, "evidence": evidence,
+        }],
+        "evidence_status": {"risk": "available", "incident": "available", "detection": "available"},
+    }
+
+
+def _case_detail_page(
+    investigation: dict[str, Any], token: str, actor: str, demo: bool, error: str | None,
+) -> str:
+    case = investigation["case"]
+    review = "<div class='notice error'><strong>需要复核</strong><span>Risk Alert 已产生新版本，请重新检查当前证据链。</span></div>" if case.get("requires_review") else ""
+    error_html = f"<div class='notice error'><strong>操作失败</strong><span>{_e(error)}</span></div>" if error else ""
+    cards = "<section class='cards'>" + "".join((
+        _card("风险分", case.get("risk_score", "—"), case.get("severity", "—")),
+        _card("状态", case.get("status", "—"), "运营状态"),
+        _card("负责人", case.get("owner") or "未分配", "本地审计身份"),
+        _card("检测时间", case.get("last_seen", "—"), f"首次 {case.get('first_seen', '—')}"),
+    )) + "</section>"
+    status_rows = [[key, value] for key, value in investigation.get("evidence_status", {}).items()]
+    alert = investigation.get("alert") or {}
+    assessment = investigation.get("assessment") or {}
+    incident = investigation.get("incident") or {}
+    chain = _raw_table(["层级", "ID / 类型", "关键结果"], [
+        ["Risk Alert", _e(alert.get("alert_id", "不可用")), _e(f"{alert.get('severity', '—')} / {alert.get('risk_score', '—')} / {alert.get('policy_reason', '—')}")],
+        ["Assessment", _e(assessment.get("assessment_id", "不可用")), _e(assessment.get("policy_action", "—"))],
+        ["Incident", _e(incident.get("incident_id", "不可用")), _e(incident.get("incident_type", "—"))],
+    ], "检测链不可用")
+    risk_breakdown = f"<h3>风险分解</h3><pre>{_e(json.dumps(assessment.get('risk_breakdown', {}), ensure_ascii=False, indent=2, sort_keys=True))}</pre>" if assessment else ""
+    candidates_html = "".join(_candidate_panel(item) for item in investigation.get("candidates", [])) or "<p class='empty'>暂无可用 Candidate。</p>"
+    evidence_rows = []
+    for candidate in investigation.get("candidates", []):
+        for item in candidate.get("evidence", []):
+            evidence_rows.append([
+                _e(item.get("event_time", "—")), _e(item.get("event_id", "—")), _e(item.get("source_type", "—")),
+                _e(item.get("source_id", "—")), _e(item.get("record_id", "—")),
+                f"<code class='copy-ref'>{_e(item.get('storage_ref', '—'))}</code>", _e(item.get("checksum", "—")), _e(item.get("reason", "—")),
+            ])
+    audit_rows = [[_e(item.get("created_at", "—")), _e(item.get("event_type", "—")), _e(item.get("actor", "—")), f"<pre class='inline-json'>{_e(json.dumps(item.get('details', {}), ensure_ascii=False, sort_keys=True))}</pre>"] for item in case.get("events", [])]
+    forms = "<p class='muted'>Demo 模式只读，处置表单已禁用。</p>" if demo else _case_action_forms(case, token, actor)
+    body = f"""<header class='page-head'><div><p class='eyebrow'>CASE INVESTIGATION</p><h1>{_e(case.get('user_name','Case'))}</h1><p>{_e(case.get('case_id'))}</p></div><a class='button secondary compact' href='/cases'>返回列表</a></header>
+{review}{error_html}{cards}
+<div class='investigation-layout'><div>
+<section class='panel'><h2>当前检测链</h2>{chain}{risk_breakdown}<h3>状态</h3>{_table(['状态库','可用性'],status_rows,'暂无状态')}</section>
+<section class='panel'><h2>Incident 上下文</h2>{_incident_summary(incident)}</section>
+<section class='panel'><h2>Candidate 时间线</h2>{candidates_html}</section>
+<section class='panel'><h2>Evidence 引用</h2><p class='muted'>仅展示不可变引用元数据，不读取或缓存原始日志。</p>{_raw_table(['时间','Event','类型','Source','Record','Storage Ref','Checksum','命中原因'],evidence_rows,'暂无 Evidence 引用')}</section>
+<section class='panel'><h2>Case 审计时间线</h2>{_raw_table(['时间','事件','Actor','详情'],audit_rows,'暂无审计事件')}</section>
+</div><div class='case-actions'><section class='panel'><h2>调查与处置</h2>{forms}</section></div></div>"""
+    return _layout("Case 调查", "cases", body, demo)
+
+
+def _candidate_panel(candidate: dict[str, Any]) -> str:
+    query = candidate.get("evidence_query", {})
+    truncated = " · Evidence 已截断" if query.get("evidence_truncated") else ""
+    return f"""<article class='candidate-panel'><header><div><strong>{_e(candidate.get('detector_family','—'))} / {_e(candidate.get('detector_id','—'))}</strong><span>{_e(candidate.get('window_start','—'))} → {_e(candidate.get('window_end','—'))}</span></div><b>{_e(candidate.get('score','—'))}</b></header>
+<p class='muted'>version {_e(candidate.get('detector_version','—'))} · mode {_e(candidate.get('detector_mode','—'))} · scope {_e(candidate.get('baseline_scope') or '—')} · group {_e(candidate.get('baseline_group_id') or '—')} · Feature rev {_e(candidate.get('feature_revision','—'))} · Baseline rev {_e(candidate.get('baseline_revision','—'))}{truncated}</p>
+<details><summary>查看 explanation</summary><pre>{_e(json.dumps(candidate.get('explanation', {}), ensure_ascii=False, indent=2, sort_keys=True))}</pre></details></article>"""
+
+
+def _incident_summary(incident: dict[str, Any]) -> str:
+    if not incident:
+        return "<p class='empty'>Incident 数据不可用。</p>"
+    items = (("检测层", incident.get("detector_families", [])), ("来源类型", incident.get("source_types", [])), ("来源 IP", incident.get("source_ips", [])), ("资源", incident.get("resources", [])))
+    return "<dl class='summary-list'>" + "".join(f"<div><dt>{_e(label)}</dt><dd>{_e(', '.join(map(str,value)) if isinstance(value,list) else value or '—')}</dd></div>" for label, value in items) + "</dl>"
+
+
+def _case_action_forms(case: dict[str, Any], token: str, actor: str) -> str:
+    base = f"<input type='hidden' name='csrf' value='{_e(token)}'><label>分析员<input name='actor' required maxlength='80' value='{_e(actor)}' placeholder='首次操作时填写'></label>"
+    case_id = _e(case["case_id"])
+    status_options = "".join(_option(item, item, case.get("status")) for item in CASE_STATUSES)
+    return f"""<div class='case-form-stack'>
+<form method='post' action='/cases/{case_id}/transition'>{base}<h3>状态</h3><label>目标状态<select name='status'>{status_options}</select></label><label>抑制期限<select name='suppression_duration'><option value=''>不设置</option><option value='1h'>1 小时</option><option value='24h'>24 小时</option><option value='7d'>7 天</option><option value='custom'>自定义</option></select></label><label>自定义期限<input name='suppression_custom' placeholder='2030-01-01T00:00:00+08:00'></label><label>备注<textarea name='note' rows='2'></textarea></label><button class='button' type='submit'>更新状态</button></form>
+<form method='post' action='/cases/{case_id}/assign'>{base}<h3>负责人</h3><label>负责人<input name='owner' value='{_e(case.get('owner') or '')}' placeholder='留空以清除'></label><label>备注<input name='note'></label><button class='button' type='submit'>保存负责人</button></form>
+<form method='post' action='/cases/{case_id}/tags'>{base}<h3>标签</h3><label>逗号分隔<input name='tags' value='{_e(', '.join(case.get('tags', [])))}'></label><button class='button' type='submit'>保存标签</button></form>
+<form method='post' action='/cases/{case_id}/comment'>{base}<h3>评论</h3><label>内容<textarea name='note' required maxlength='4000' rows='5'></textarea></label><button class='button' type='submit'>添加评论</button></form>
+</div>"""
+
+
+def _suppression_until(status: str, duration: str, custom: str) -> str | None:
+    if status not in CASE_STATUSES:
+        raise ConsoleError(f"unsupported case status: {status}")
+    if status != "suppressed":
+        if duration or custom.strip():
+            raise ConsoleError("仅 suppressed 状态可以设置抑制期限")
+        return None
+    if duration in {"1h", "24h", "7d"}:
+        delta = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}[duration]
+        return (datetime.now(timezone.utc) + delta).isoformat()
+    if duration != "custom" or not custom.strip():
+        raise ConsoleError("suppressed 状态必须选择抑制期限")
+    try:
+        parsed = datetime.fromisoformat(custom.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ConsoleError("自定义抑制期限必须是 ISO-8601 时间") from exc
+    if parsed.tzinfo is None:
+        raise ConsoleError("自定义抑制期限必须包含时区")
+    return custom.strip()
+
+
+def _query_one(query: dict[str, list[str]], name: str) -> str:
+    values = query.get(name)
+    return values[0] if values else ""
 
 
 def _layout(title: str, active: str, body: str, demo: bool) -> str:
@@ -1070,6 +1375,8 @@ td a{color:var(--accent);font-weight:700;text-decoration:none}
 .status.running{background:#fef3c7;color:#92400e}
 .status.pending{background:#dbeafe;color:#1e40af}
 .status.active{background:#dcfce7;color:#166534}.status.shadow{background:#e0f2fe;color:#075985}.status.draft{background:#fef3c7;color:#92400e}.status.disabled,.status.deprecated{background:#eef1f5;color:#596579}
+.status.new{background:#dbeafe;color:#1e40af}.status.acknowledged{background:#e0f2fe;color:#075985}.status.investigating{background:#fef3c7;color:#92400e}.status.resolved{background:#dcfce7;color:#166534}.status.false_positive{background:#f1f5f9;color:#475569}.status.suppressed{background:#ede9fe;color:#6d28d9}
+.review-flag{display:inline-block;padding:4px 8px;border-radius:99px;background:#fff1f2;color:#be123c;font-size:11px;font-weight:800}
 .progress-list{display:grid;gap:17px;margin:5px 0 20px}
 .progress-list header{display:flex;justify-content:space-between;font-size:13px}
 .track{height:8px;background:#e0edf8;border-radius:99px;margin-top:7px;overflow:hidden}
@@ -1083,6 +1390,8 @@ td a{color:var(--accent);font-weight:700;text-decoration:none}
 .form-grid label{display:grid;gap:6px;color:var(--muted);font-size:12px}
 .form-grid input,.form-grid select{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px;background:#fff;color:var(--ink)}
 .form-grid input:focus,.form-grid select:focus{outline:3px solid #bfdbfe;border-color:#60a5fa}
+.case-filters{display:grid;grid-template-columns:2fr repeat(4,1fr) auto auto;gap:12px;align-items:end}.case-filters label,.case-form-stack label{display:grid;gap:6px;color:var(--muted);font-size:12px}.case-filters input,.case-filters select,.case-form-stack input,.case-form-stack select,.case-form-stack textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px;background:#fff;color:var(--ink);font:inherit}.button.compact{margin-top:0;padding:10px 13px}.pagination{display:flex;justify-content:flex-end;align-items:center;gap:14px;margin-top:18px}.pagination a{color:var(--accent);font-weight:700;text-decoration:none}.pagination span{color:var(--muted);font-size:13px}
+.investigation-layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:20px;align-items:start}.case-actions{position:sticky;top:24px}.case-form-stack{display:grid;gap:22px}.case-form-stack form{display:grid;gap:10px;padding-bottom:20px;border-bottom:1px solid var(--line)}.case-form-stack form:last-child{border-bottom:0}.case-form-stack h3{margin:4px 0 0;font-size:14px}.candidate-panel{border:1px solid var(--line);border-radius:11px;padding:17px;margin:12px 0;background:#fafdff}.candidate-panel header{display:flex;justify-content:space-between;gap:15px}.candidate-panel header span{display:block;color:var(--muted);font-size:12px;margin-top:5px}.candidate-panel header b{font-size:27px;color:var(--accent)}.candidate-panel summary{cursor:pointer;color:var(--accent);font-weight:700}.summary-list{display:grid;grid-template-columns:1fr 1fr;gap:12px}.summary-list div{padding:13px;background:#f5faff;border-radius:9px}.summary-list dt{font-size:11px;color:var(--muted);margin-bottom:5px}.summary-list dd{margin:0;word-break:break-word}.copy-ref{display:block;max-width:300px;word-break:break-all;color:#175d95}.inline-json{margin:0;max-height:130px;min-width:220px;font-size:11px;padding:9px}
 .wizard label,.stack label,.source-grid label,.sample-grid label{display:grid;gap:7px;color:var(--muted);font-size:12px}
 .wizard input,.wizard select,.wizard textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:11px;background:#fff;color:var(--ink);font:inherit}
 .wizard input:focus,.wizard select:focus,.wizard textarea:focus{outline:3px solid #bfdbfe;border-color:#60a5fa}
@@ -1099,7 +1408,7 @@ td a{color:var(--accent);font-weight:700;text-decoration:none}
 pre{white-space:pre-wrap;word-break:break-word;background:#153754;color:#dff3ff;padding:16px;border:1px solid #285879;border-radius:9px;max-height:520px;overflow:auto}
 .demo-banner{position:fixed;z-index:3;top:0;left:220px;right:0;background:#dceeff;color:#185d96;border-bottom:1px solid #b9d9f2;text-align:center;font-size:11px;font-weight:800;letter-spacing:.08em;padding:6px}
 .demo-banner+.shell main{padding-top:70px}
-@media(max-width:1100px){.source-grid{grid-template-columns:1fr 1fr}.preview-stats{grid-template-columns:1fr 1fr}}
+@media(max-width:1100px){.source-grid{grid-template-columns:1fr 1fr}.preview-stats{grid-template-columns:1fr 1fr}.case-filters{grid-template-columns:1fr 1fr 1fr}.investigation-layout{grid-template-columns:1fr}.case-actions{position:static}}
 @media(max-width:950px){.shell{grid-template-columns:1fr}aside{position:static;height:auto}nav{display:flex;overflow:auto;margin-top:20px}.aside-foot{display:none}main{padding:28px}.cards{grid-template-columns:1fr 1fr}.grid.two,.sample-grid,.condition-row{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr 1fr}.demo-banner{left:0}}
 @media(max-width:560px){.cards,.form-grid,.detectors,.source-grid,.preview-stats,.field-checks{grid-template-columns:1fr}.hero,.page-head{align-items:flex-start;gap:20px;flex-direction:column}main{padding:18px}}
 """

@@ -360,6 +360,12 @@ conda run -n agent python -m logfusion cases transition \
 
 支持 `new`、`acknowledged`、`investigating`、`resolved`、`false_positive`、`suppressed` 状态，以及 `assign`、`comment`、`set-tags`。`suppressed` 必须指定未来的 `--suppression-until`；到期后下一次 `cases sync` 自动恢复为 `new`。所有操作都写入 Case DB 的审计事件。终态 Case 收到新的风险告警版本时保持运营状态，但标记 `requires_review: true`，由分析员决定是否重新打开。Case 状态、评论和标签只用于调查、处置与审计，不作为模型训练样本或 Evaluation 真值。
 
+Web Console 的“Cases”页面提供服务端分页和用户、状态、严重度、负责人、待复核筛选。点击 Case 后按精确 ID 展示当前 `Risk Alert → Assessment → Incident → Candidate → Evidence` 调查链，以及检测 family、模型/规则版本、分数、解释、来源、IP、资源和 Case 审计事件；即使 Candidate 已 superseded，只要仍被当前 Incident 引用就会显示。Risk、Incident 或 Detection 状态缺失时对应区域降级提示，不影响 Case 本身的查看和人工操作。
+
+详情页支持状态转换、负责人、评论和标签。抑制可以选择 1 小时、24 小时、7 天，或输入带时区的 ISO-8601 截止时间。首次操作填写的分析员名称保存在 30 天有效的本地 `logfusion_actor` Cookie 中，仅作为审计 actor，不是登录或授权机制。Demo 模式继续只读。
+
+调查页严格保持 Evidence 隐私边界：只显示 event/source/record ID、时间、`storage_ref`、checksum、命中原因和截断信息；不会读取 Raw Store，不会把 `storage_ref` 转成原文访问链接，也不会将 Case 操作回流为训练标签。
+
 ## Unsupervised Detection Backtest & Evaluation v4
 
 Evaluation 只读取 Feature 和 Baseline DB，不读取 Case，也不会写入生产 Baseline、Detection、Incident 或 Risk DB。它按 UTC 自然日评估：对每个被评估日，仅使用此前 30 天的 Feature 数据构建 point-in-time 基线或训练模型，因此当天及未来行为不会泄露到参照分布中。Evaluation DB v4 不兼容旧版本；旧实验应从当前 Feature/Baseline 状态重跑。
